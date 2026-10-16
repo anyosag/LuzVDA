@@ -75,6 +75,8 @@ Any PC that trusts your certificate will install drivers and run software you si
 
 ## Installing and trying it
 
+For a first install next to SudoVDA, follow [docs/first-test.md](docs/first-test.md).
+
 Apollo's installer does this. By hand, from the signed zip, in an elevated prompt:
 
 ```bat

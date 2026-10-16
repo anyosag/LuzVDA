@@ -566,6 +566,7 @@ static void usage() {
     "  capture-test <guid> [options]  compare the frame channel with Desktop Duplication on the same frames\n"
     "      --add                    add a MacBook Pro-like display with this GUID first, and remove it after\n"
     "      --seconds N              how long to measure (default 20)\n"
+    "      --hdr on|off             switch the display's HDR first\n"
     "      --hdr-switch-every N     switch the display's HDR off and on every N seconds\n"
     "      --only channel|duplication\n"
     "      --debug-privilege        enable SeDebugPrivilege, so the channel's handles can be duplicated\n"
@@ -1434,6 +1435,7 @@ static int cmd_capture_test(int argc, char **argv) {
   bool add = false;
   bool debug_privilege = false;
   std::string only;
+  std::string hdr;
   for (int i = 3; i < argc; ++i) {
     if (std::strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
       seconds = std::atof(argv[++i]);
@@ -1445,13 +1447,15 @@ static int cmd_capture_test(int argc, char **argv) {
       only = argv[++i];
     } else if (std::strcmp(argv[i], "--debug-privilege") == 0) {
       debug_privilege = true;
+    } else if (std::strcmp(argv[i], "--hdr") == 0 && i + 1 < argc) {
+      hdr = argv[++i];
     } else {
       std::fprintf(stderr, "Unknown option %s\n", argv[i]);
       return 2;
     }
   }
-  if (seconds < 3 || (!only.empty() && only != "channel" && only != "duplication")) {
-    std::fprintf(stderr, "--seconds is at least 3, and --only is channel or duplication\n");
+  if (seconds < 3 || (!only.empty() && only != "channel" && only != "duplication") || (!hdr.empty() && hdr != "on" && hdr != "off")) {
+    std::fprintf(stderr, "--seconds is at least 3, --only is channel or duplication, and --hdr is on or off\n");
     return 2;
   }
 
@@ -1523,15 +1527,26 @@ static int cmd_capture_test(int argc, char **argv) {
     status = 1;
   }
 
+  if (!status && !hdr.empty()) {
+    std::printf("HDR %s before measuring: %s\n", hdr.c_str(), set_hdr(entry, hdr == "on") ? "ok" : "failed");
+  }
+
   pattern_window_t window;
   if (!status) {
-    // Let Windows settle after adding the display
+    // Let Windows settle after adding the display, or switching HDR
     for (int i = 0; i < 20; ++i) {
       request(device.handle, IOCTL_LUZVDA_PING, nullptr, 0, nullptr, 0, "Pinging");
       Sleep(100);
     }
     monitor_rect(active.gdi_name, monitor);
-    std::printf("Display %ls: %ldx%ld at %ld,%ld, %.3f Hz\n", active.gdi_name.c_str(), monitor.right - monitor.left, monitor.bottom - monitor.top, monitor.left, monitor.top, rate_hz(active.path.targetInfo.refreshRate));
+    find_active(entry, active);
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color = {};
+    color.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    color.header.size = sizeof(color);
+    color.header.adapterId = active.path.targetInfo.adapterId;
+    color.header.id = active.path.targetInfo.id;
+    bool color_known = DisplayConfigGetDeviceInfo(&color.header) == ERROR_SUCCESS;
+    std::printf("Display %ls: %ldx%ld at %ld,%ld, %.3f Hz, HDR %s\n", active.gdi_name.c_str(), monitor.right - monitor.left, monitor.bottom - monitor.top, monitor.left, monitor.top, rate_hz(active.path.targetInfo.refreshRate), !color_known ? "unknown" : color.advancedColorEnabled ? "on" : "off");
     std::string error = window.create(monitor);
     if (!error.empty()) {
       std::fprintf(stderr, "The code's window: %s\n", error.c_str());
@@ -1567,7 +1582,7 @@ static int cmd_capture_test(int argc, char **argv) {
     int64_t end = start + (int64_t) (seconds * 1000.0 / ms_per_tick);
     int64_t next_ping = start;
     int64_t next_toggle = toggle_every > 0 ? start + (int64_t) (toggle_every * 1000.0 / ms_per_tick) : INT64_MAX;
-    bool hdr_on = true;
+    bool hdr_on = hdr != "off";
     uint64_t presented = 0;
     std::vector<int64_t> toggles;
     for (int64_t now = start; now < end; now = qpc_now()) {
@@ -1598,8 +1613,8 @@ static int cmd_capture_test(int argc, char **argv) {
     if (duplication_thread.joinable()) {
       duplication_thread.join();
     }
-    if (!hdr_on) {
-      set_hdr(entry, true);
+    if (toggles.size() % 2) {
+      set_hdr(entry, hdr != "off");
     }
 
     std::printf("\nThe window presented %llu frames in %.1f s after a 1 s warm-up (%.1f per second)\n", (unsigned long long) presented, (double) (finished - warm) * ms_per_tick / 1000.0, (double) presented * 1000.0 / ((double) (finished - warm) * ms_per_tick));

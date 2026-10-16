@@ -31,12 +31,24 @@ jobs:
           gcc -std=c11 -Wall -Wextra -Werror -Iinclude "$RUNNER_TEMP/ioctl.c" -o "$RUNNER_TEMP/ioctl_c"
           g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -x c++ "$RUNNER_TEMP/ioctl.c" -o "$RUNNER_TEMP/ioctl_cpp"
 
+      # The frame consumer is Windows-only; MinGW checks it builds as Apollo would include it
+      - name: Frame helpers build for Windows (MinGW, C++17 and C++23)
+        run: |
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix
+          printf '#include "luzvda/luzvda-frames.h"\nint main() { luzvda::frames::consumer_t c; return c.header() ? 1 : 0; }\n' > "$RUNNER_TEMP/frames.cpp"
+          for std in c++17 c++23; do
+            x86_64-w64-mingw32-g++-posix -std=$std -Wall -Wextra -Werror -Iinclude -fsyntax-only "$RUNNER_TEMP/frames.cpp"
+          done
+          x86_64-w64-mingw32-g++-posix -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc -fsyntax-only src/driver/FrameChannel.cpp
+
       - name: Unit tests
         run: |
-          for t in validate edid_builder; do
-            g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude -Isrc "tests/${t}_test.cpp" -o "$RUNNER_TEMP/$t"
+          for t in validate edid_builder frame_channel frame_code; do
+            g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude -Isrc -Itools "tests/${t}_test.cpp" -o "$RUNNER_TEMP/$t"
           done
           "$RUNNER_TEMP/validate"
+          "$RUNNER_TEMP/frame_channel"
+          "$RUNNER_TEMP/frame_code"
           mkdir -p "$RUNNER_TEMP/edids"
           "$RUNNER_TEMP/edid_builder" "$RUNNER_TEMP/edids"
 
@@ -96,7 +108,7 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSDIR=%%i
           call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
-          cl /nologo /std:c++17 /EHsc /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Iinclude tools\luzvda-ctl\luzvda-ctl.cpp /Fe:luzvda-ctl.exe setupapi.lib newdev.lib dxgi.lib ole32.lib user32.lib || exit /b 1
+          cl /nologo /std:c++17 /EHsc /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Iinclude tools\luzvda-ctl\luzvda-ctl.cpp /Fe:luzvda-ctl.exe setupapi.lib newdev.lib dxgi.lib d3d11.lib ole32.lib user32.lib advapi32.lib || exit /b 1
 
       # Unsigned: the owner signs with their own key on their own PC (scripts/sign-package.ps1)
       - name: Package
@@ -116,7 +128,7 @@ jobs:
           $out = "dist\$name"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "$pkg\LuzVDA.inf", "$pkg\LuzVDA.dll", "$pkg\luzvda.cat" $out
-          Copy-Item luzvda-ctl.exe, include\luzvda\luzvda-ioctl.h, LICENSE, NOTICE.md $out
+          Copy-Item luzvda-ctl.exe, include\luzvda\luzvda-ioctl.h, include\luzvda\luzvda-frames.h, LICENSE, NOTICE.md $out
           Copy-Item scripts\*.ps1 $out
           Compress-Archive -Path "$out\*" -DestinationPath "dist\$name.zip"
           Get-FileHash "dist\$name.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $name.zip" } | Set-Content dist\SHA256SUMS.txt

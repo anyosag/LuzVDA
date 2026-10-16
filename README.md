@@ -38,7 +38,9 @@ Installing next to SudoVDA while Apollo holds SudoVDA open needs a restart to fi
 
 ## Control interface
 
-`include/luzvda/luzvda-ioctl.h` (MIT) defines protocol 1.0: get version, ping, get watchdog, add, remove, update modes, set render adapter, and list. Callers open the device interface `{15d7851f-629d-4e2a-bffd-9c5f43ddd57a}` for reading and writing.
+`include/luzvda/luzvda-ioctl.h` (MIT) defines protocol 1.1: get version, ping, get watchdog, add, remove, update modes, set render adapter, list, and (from 1.1) open a display's frame channel. Callers open the device interface `{15d7851f-629d-4e2a-bffd-9c5f43ddd57a}` for reading and writing.
+
+**Frame channel (1.1, experimental).** Once a caller opens it, the driver copies each frame of that display into one of three shared textures on the GPU it renders on. Only SYSTEM and Administrators can open them. Copying stops 2 s after the caller stops asking, so the driver does no extra work for displays nobody reads. `include/luzvda/luzvda-frames.h` (MIT) has the object names and a consumer that takes the newest frame. It's a candidate replacement for capturing the display with Desktop Duplication; `luzvda-ctl capture-test` measures the two on the same frames.
 
 The watchdog removes every display when no request has arrived for its timeout (3 s by default), so a crashed caller doesn't leave displays behind. Callers ping at a third of the timeout.
 
@@ -102,3 +104,5 @@ luzvda-ctl add 6a0b9c1e-3f4d-4c2a-9e7b-1d2c3b4a5f60 --name "MacBook Pro" --mode 
 - `luzvda-ctl diag` shows what Windows and DXGI report for it: mode, monitor name, HDR state, luminance, primaries, and the rendering GPU.
 - `luzvda-ctl set-mode <guid> 3024x1890@60` asks Windows to switch modes.
 - `luzvda-ctl hdr <guid> on` switches HDR.
+
+`luzvda-ctl capture-test <guid> --add --seconds 30` adds a display, draws the time each frame is presented in a corner of it, and reads that time back through the frame channel and through Desktop Duplication at once, frame by frame. It prints each path's latency (p50/p95/p99/max), the frames it missed, its longest wait for a new frame and how often it had to start over. Add `--hdr-switch-every 10` to see how each recovers from HDR switches. It needs an unlocked desktop: Desktop Duplication can't capture the lock screen from an administrator's prompt.

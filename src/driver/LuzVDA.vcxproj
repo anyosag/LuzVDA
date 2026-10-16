@@ -12,13 +12,16 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
+    <ClCompile Include="FrameChannel.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AdapterOption.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="FrameChannel.h" />
     <ClInclude Include="..\common\validate.h" />
     <ClInclude Include="..\edid\edid_builder.h" />
     <ClInclude Include="..\..\include\luzvda\luzvda-ioctl.h" />
+    <ClInclude Include="..\..\include\luzvda\luzvda-frames.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="LuzVDA.inf" />

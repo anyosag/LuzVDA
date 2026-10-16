@@ -33,6 +33,8 @@ Environment:
 
 #include <luzvda/luzvda-ioctl.h>
 
+#include "FrameChannel.h"
+
 namespace Microsoft
 {
 	namespace WRL
@@ -68,7 +70,7 @@ namespace LuzVDA
 	class SwapChainProcessor
 	{
 	public:
-		SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
+		SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, std::shared_ptr<FrameChannel> Frames);
 		~SwapChainProcessor();
 
 	private:
@@ -80,6 +82,7 @@ namespace LuzVDA
 		IDDCX_SWAPCHAIN m_hSwapChain;
 		std::shared_ptr<Direct3DDevice> m_Device;
 		HANDLE m_hAvailableBufferEvent;
+		std::shared_ptr<FrameChannel> m_Frames;
 		Microsoft::WRL::Wrappers::Thread m_hThread;
 		Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
 	};
@@ -102,6 +105,9 @@ namespace LuzVDA
 		const uint32_t serial;
 		const UINT connector;
 		std::array<uint8_t, 256> edid{};
+
+		// Frames for a caller that opened the channel; shared with the swap-chain thread
+		const std::shared_ptr<FrameChannel> frames;
 
 		// The modes reported when the monitor arrived, and the target modes, which an update request
 		// can replace. Windows offers modes that are in both. Guarded by the registry lock.

@@ -1,5 +1,5 @@
 /*
- * LuzVDA control interface, protocol 1.0.
+ * LuzVDA control interface, protocol 1.1.
  *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 LuzVDA contributors
@@ -62,9 +62,12 @@ extern "C" {
 #define IOCTL_LUZVDA_SET_RENDER_ADAPTER LUZVDA_CTL_CODE(0x813, LUZVDA_ACCESS_READ_WRITE)
 /* Out: LUZVDA_LIST */
 #define IOCTL_LUZVDA_LIST_DISPLAYS LUZVDA_CTL_CODE(0x814, LUZVDA_ACCESS_READ)
+/* In: LUZVDA_GUID. Out: LUZVDA_FRAME_CHANNEL. Makes the display's frames available to the caller;
+ * see "Frame channel" below. Protocol 1.1 */
+#define IOCTL_LUZVDA_OPEN_FRAME_CHANNEL LUZVDA_CTL_CODE(0x815, LUZVDA_ACCESS_READ_WRITE)
 
 #define LUZVDA_PROTOCOL_MAJOR 1u
-#define LUZVDA_PROTOCOL_MINOR 0u
+#define LUZVDA_PROTOCOL_MINOR 1u
 
 /* The device interface: {15d7851f-629d-4e2a-bffd-9c5f43ddd57a} */
 #define LUZVDA_INTERFACE_GUID_INIT {0x15d7851f, 0x629d, 0x4e2a, {0xbf, 0xfd, 0x9c, 0x5f, 0x43, 0xdd, 0xd5, 0x7a}}
@@ -163,6 +166,101 @@ typedef struct LUZVDA_LIST {
   LUZVDA_LIST_ENTRY displays[LUZVDA_MAX_DISPLAYS];
 } LUZVDA_LIST;
 
+/*
+ * Frame channel (protocol 1.1)
+ *
+ * Once a caller opens a display's channel, the driver copies each frame Windows gives it into one of
+ * LUZVDA_FRAME_SLOTS shared textures on the GPU the display renders on, and describes them in a
+ * shared LUZVDA_FRAME_HEADER. The objects are named after the prefix in LUZVDA_FRAME_CHANNEL, and
+ * only SYSTEM and Administrators can open them:
+ *
+ *   <prefix>-header       file mapping holding LUZVDA_FRAME_HEADER
+ *   <prefix>-ready        auto-reset event, set after each frame
+ *   <prefix>-g<G>-s<S>    texture S (from 0) of generation G, with a keyed mutex (key 0)
+ *
+ * The same objects can also be duplicated from the driver's process (owner_pid) with the handle
+ * values given here and in the header's slots. That is the safer way, since a name only says what
+ * an object is called: an object the driver couldn't create under its name (another already had it)
+ * is unnamed, and the header's names field says which have names.
+ *
+ * One consumer at a time:
+ *   1. Write QueryPerformanceCounter to consumer_qpc at least every second. The driver copies frames
+ *      only while that value is under LUZVDA_FRAME_IDLE_MS old, and starts again on the next write.
+ *   2. Wait for the ready event. When generation differs from the one whose textures you hold, open
+ *      that generation's textures, after reading width, height and dxgi_format, and check generation
+ *      again afterwards. 0 means none yet.
+ *   3. Take the slot in latest (LUZVDA_FRAME_LATEST_SLOT), acquire its keyed mutex with key 0, read
+ *      the slot's entry, copy the texture, and release the mutex with key 0. The driver never writes
+ *      the newest slot, nor one whose mutex is held.
+ * The header's 64-bit fields change atomically; state LUZVDA_FRAME_CLOSED means the display is gone.
+ */
+#define LUZVDA_FRAME_SLOTS 3u
+#define LUZVDA_FRAME_MAGIC 0x4D52464Cu /* "LFRM" */
+#define LUZVDA_FRAME_VERSION 1u
+#define LUZVDA_FRAME_IDLE_MS 2000u
+#define LUZVDA_FRAME_OPEN 1u
+#define LUZVDA_FRAME_CLOSED 2u
+#define LUZVDA_FRAME_PREFIX_BYTES 64u
+#define LUZVDA_FRAME_NAMED_READY 0x100u
+
+/* latest holds (frame << 8) | slot; 0 while there is no frame */
+#define LUZVDA_FRAME_LATEST_FRAME(latest) ((latest) >> 8)
+#define LUZVDA_FRAME_LATEST_SLOT(latest) ((uint32_t) ((latest) & 0xFFu))
+
+typedef struct LUZVDA_FRAME_CHANNEL {
+  /* sizeof(LUZVDA_FRAME_CHANNEL) */
+  uint32_t struct_size;
+  /* The driver's process, for DuplicateHandle */
+  uint32_t owner_pid;
+  /* The header's file mapping and the ready event, as handles in owner_pid */
+  uint64_t header_handle;
+  uint64_t ready_handle;
+  /* ASCII, ending in NUL: Global\LuzVDA-<display GUID> */
+  char prefix[LUZVDA_FRAME_PREFIX_BYTES];
+} LUZVDA_FRAME_CHANNEL;
+
+typedef struct LUZVDA_FRAME_SLOT {
+  /* The driver's count of frames copied (from 1) for the frame in this slot; 0 while empty */
+  uint64_t frame;
+  /* QueryPerformanceCounter when Windows gave the driver the frame, and after the copy was queued */
+  int64_t acquired_qpc;
+  int64_t copied_qpc;
+  /* The texture, as a handle in owner_pid */
+  uint64_t handle;
+} LUZVDA_FRAME_SLOT;
+
+typedef struct LUZVDA_FRAME_HEADER {
+  /* LUZVDA_FRAME_MAGIC and LUZVDA_FRAME_VERSION */
+  uint32_t magic;
+  uint32_t version;
+  /* LUZVDA_FRAME_OPEN or LUZVDA_FRAME_CLOSED */
+  uint32_t state;
+  /* The textures' generation, from 1; it changes when they're made again for another size, format
+   * or GPU */
+  uint32_t generation;
+  /* The textures: size, DXGI_FORMAT, and the GPU they're on */
+  uint32_t width;
+  uint32_t height;
+  uint32_t dxgi_format;
+  uint32_t slot_count;
+  LUZVDA_LUID adapter;
+  int64_t qpc_frequency;
+  /* See LUZVDA_FRAME_LATEST_FRAME and LUZVDA_FRAME_LATEST_SLOT */
+  uint64_t latest;
+  /* Written by the consumer; see step 1 above */
+  int64_t consumer_qpc;
+  uint64_t frames_copied;
+  /* Frames not copied because no slot was free */
+  uint64_t frames_dropped;
+  /* HRESULT of the last failure to make or fill the textures; 0 if none */
+  uint32_t last_error;
+  uint32_t owner_pid;
+  /* Which objects have their names: bit S for slot S of this generation, LUZVDA_FRAME_NAMED_READY */
+  uint32_t names;
+  uint32_t reserved;
+  LUZVDA_FRAME_SLOT slots[LUZVDA_FRAME_SLOTS];
+} LUZVDA_FRAME_HEADER;
+
 #ifdef __cplusplus
 }
   #define LUZVDA_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
@@ -192,5 +290,16 @@ LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_UPDATE_MODES, modes) == 28, "LUZVDA_UPDATE_
 LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_UPDATE_MODES) == 412, "LUZVDA_UPDATE_MODES");
 LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_LIST_ENTRY) == 44, "LUZVDA_LIST_ENTRY");
 LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_LIST) == 712, "LUZVDA_LIST");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_CHANNEL, header_handle) == 8, "LUZVDA_FRAME_CHANNEL.header_handle");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_CHANNEL, prefix) == 24, "LUZVDA_FRAME_CHANNEL.prefix");
+LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_FRAME_CHANNEL) == 88, "LUZVDA_FRAME_CHANNEL");
+LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_FRAME_SLOT) == 32, "LUZVDA_FRAME_SLOT");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, adapter) == 32, "LUZVDA_FRAME_HEADER.adapter");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, latest) == 48, "LUZVDA_FRAME_HEADER.latest");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, consumer_qpc) == 56, "LUZVDA_FRAME_HEADER.consumer_qpc");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, last_error) == 80, "LUZVDA_FRAME_HEADER.last_error");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, names) == 88, "LUZVDA_FRAME_HEADER.names");
+LUZVDA_STATIC_ASSERT(offsetof(LUZVDA_FRAME_HEADER, slots) == 96, "LUZVDA_FRAME_HEADER.slots");
+LUZVDA_STATIC_ASSERT(sizeof(LUZVDA_FRAME_HEADER) == 192, "LUZVDA_FRAME_HEADER");
 
 #endif /* LUZVDA_IOCTL_H */

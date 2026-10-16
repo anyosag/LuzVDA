@@ -1,9 +1,10 @@
-// luzvda-ctl: installs LuzVDA, removes SudoVDA, and adds, inspects and removes displays by hand.
+// luzvda-ctl: installs LuzVDA, removes SudoVDA, adds, inspects and removes displays by hand, and
+// measures how fast a display's frames arrive (capture-test).
 // Run it from an elevated prompt: the driver opens only for SYSTEM and Administrators.
 //
 // Builds with MSVC and MinGW:
-//   cl /std:c++17 /EHsc /O2 /I..\..\include luzvda-ctl.cpp setupapi.lib newdev.lib dxgi.lib ole32.lib user32.lib
-//   x86_64-w64-mingw32-g++ -std=c++17 -O2 -static -I../../include luzvda-ctl.cpp -lsetupapi -lnewdev -ldxgi -lole32 -luser32
+//   cl /std:c++17 /EHsc /O2 /I..\..\include luzvda-ctl.cpp setupapi.lib newdev.lib dxgi.lib d3d11.lib ole32.lib user32.lib advapi32.lib
+//   x86_64-w64-mingw32-g++ -std=c++17 -O2 -static -I../../include luzvda-ctl.cpp -lsetupapi -lnewdev -ldxgi -ld3d11 -lole32 -luser32 -ladvapi32
 //
 // SPDX-License-Identifier: MS-PL
 
@@ -18,17 +19,27 @@
 #include <conio.h>
 
 #include <luzvda/luzvda-ioctl.h>
+#include <luzvda/luzvda-frames.h>
+
+#include "frame_code.h"
 
 // MSVC's setupapi.h has it; MinGW's doesn't
 #ifndef MAX_CLASS_NAME_LEN
 #define MAX_CLASS_NAME_LEN 32
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 static const GUID s_InterfaceGuid = LUZVDA_INTERFACE_GUID_INIT;
@@ -552,6 +563,12 @@ static void usage() {
     "  hdr <guid> on|off            switch Windows HDR on the display\n"
     "  set-adapter auto|TEXT        render on the GPU with most memory, or whose name contains TEXT\n"
     "  ping\n"
+    "  capture-test <guid> [options]  compare the frame channel with Desktop Duplication on the same frames\n"
+    "      --add                    add a MacBook Pro-like display with this GUID first, and remove it after\n"
+    "      --seconds N              how long to measure (default 20)\n"
+    "      --hdr-switch-every N     switch the display's HDR off and on every N seconds\n"
+    "      --only channel|duplication\n"
+    "      --debug-privilege        enable SeDebugPrivilege, so the channel's handles can be duplicated\n"
     "  install <LuzVDA.inf>         create the device and install the driver\n"
     "  uninstall                    remove the device and its driver packages\n"
     "  remove-legacy                remove SudoVDA's device and driver packages\n",
@@ -842,6 +859,792 @@ static int cmd_ping() {
 
 #pragma endregion
 
+#pragma region Capture test
+
+// Compares the two ways to get a LuzVDA display's frames: the driver's frame channel (protocol 1.1)
+// and Windows' Desktop Duplication, which Apollo uses today. A window on the display draws, in each
+// frame, the time just before it was presented (frame_code.h). Both paths take the same frames and
+// read that time back, so each path's latency is measured from the same start, frame by frame.
+
+static int64_t qpc_now() {
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  return now.QuadPart;
+}
+
+static int64_t qpc_frequency() {
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  return f.QuadPart;
+}
+
+template <class T>
+static void release(T *&p) {
+  if (p) {
+    p->Release();
+    p = nullptr;
+  }
+}
+
+struct capture_sample_t {
+  uint64_t code;  // QueryPerformanceCounter just before the window presented the frame
+  int64_t available;  // when the path had the frame: the channel's ready event, or AcquireNextFrame
+  int64_t read;  // once its pixels were on the CPU
+  int64_t driver_acquired;  // channel: when Windows gave the driver the frame
+  int64_t driver_copied;  // channel: when the driver had queued its copy
+  int64_t presented;  // Desktop Duplication: the frame's LastPresentTime
+};
+
+struct capture_path_t {
+  const char *name;
+  bool enabled = true;
+  bool failed = false;
+  std::string setup;
+  std::vector<capture_sample_t> samples;
+  uint64_t frames = 0;  // frames taken
+  uint64_t undecoded = 0;  // frames whose code didn't read (a tear, or the window not drawn yet)
+  std::vector<int64_t> restarts;  // when the path had to start over
+  std::string counters;
+};
+
+// A texture that holds the code's area of a frame, copied for the CPU to read
+struct code_reader_t {
+  ID3D11Texture2D *staging = nullptr;
+  uint32_t format = 0;
+
+  ~code_reader_t() {
+    release(staging);
+  }
+
+  // Queues the copy of the code's area; false if the frame is too small or of an unknown format
+  bool copy(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *frame) {
+    D3D11_TEXTURE2D_DESC desc;
+    frame->GetDesc(&desc);
+    namespace fc = luzvda::frame_code;
+    if ((int) desc.Width < fc::k_left + fc::k_width || (int) desc.Height < fc::k_top + fc::k_height || fc::bytes_per_pixel(desc.Format) == 0) {
+      return false;
+    }
+    if (!staging || format != (uint32_t) desc.Format) {
+      release(staging);
+      D3D11_TEXTURE2D_DESC s = {};
+      s.Width = fc::k_width;
+      s.Height = fc::k_height;
+      s.MipLevels = 1;
+      s.ArraySize = 1;
+      s.Format = desc.Format;
+      s.SampleDesc.Count = 1;
+      s.Usage = D3D11_USAGE_STAGING;
+      s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(device->CreateTexture2D(&s, nullptr, &staging))) {
+        return false;
+      }
+      format = (uint32_t) desc.Format;
+    }
+    D3D11_BOX box = {(UINT) fc::k_left, (UINT) fc::k_top, 0, (UINT) (fc::k_left + fc::k_width), (UINT) (fc::k_top + fc::k_height), 1};
+    context->CopySubresourceRegion(staging, 0, 0, 0, 0, frame, 0, &box);
+    return true;
+  }
+
+  // Waits for the copy and decodes it
+  bool read(ID3D11DeviceContext *context, uint64_t &code) {
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+      return false;
+    }
+    namespace fc = luzvda::frame_code;
+    const uint8_t *base = (const uint8_t *) mapped.pData;
+    int bpp = fc::bytes_per_pixel(format);
+    uint32_t f = format;
+    bool ok = fc::decode([&](int x, int y) {
+      return fc::is_light(f, base + (size_t) (y - fc::k_top) * mapped.RowPitch + (size_t) (x - fc::k_left) * bpp);
+    }, code);
+    context->Unmap(staging, 0);
+    return ok;
+  }
+};
+
+static bool make_device(IDXGIAdapter1 *adapter, ID3D11Device1 *&device, ID3D11DeviceContext *&context) {
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  ID3D11Device *base = nullptr;
+  HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &base, nullptr, &context);
+  if (FAILED(hr)) {
+    return false;
+  }
+  hr = base->QueryInterface(__uuidof(ID3D11Device1), (void **) &device);
+  base->Release();
+  if (FAILED(hr)) {
+    release(context);
+    return false;
+  }
+  return true;
+}
+
+static IDXGIAdapter1 *adapter_by_luid(const LUID &luid) {
+  IDXGIFactory4 *factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **) &factory))) {
+    return nullptr;
+  }
+  IDXGIAdapter1 *adapter = nullptr;
+  factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void **) &adapter);
+  factory->Release();
+  return adapter;
+}
+
+static std::string hex(HRESULT hr) {
+  char out[16];
+  std::snprintf(out, sizeof(out), "0x%08lX", (unsigned long) hr);
+  return out;
+}
+
+static void run_channel(HANDLE driver, const LUZVDA_GUID &guid, capture_path_t &path, const std::atomic<bool> &stop) {
+  luzvda::frames::consumer_t channel;
+  DWORD error = channel.open(driver, guid);
+  if (error) {
+    path.failed = true;
+    path.setup = "opening the channel failed, error " + std::to_string(error) + (error == ERROR_INVALID_FUNCTION ? " (a driver older than protocol 1.1?)" : "");
+    return;
+  }
+
+  // The textures, and the GPU they're on, come with the first frame the driver copies
+  for (int i = 0; i < 40 && !channel.has_textures() && !stop; ++i) {
+    channel.heartbeat();
+    Sleep(50);
+  }
+  if (!channel.has_textures()) {
+    path.failed = true;
+    path.setup = "no frame within 2 s; the driver's last error " + hex((HRESULT) channel.header()->last_error);
+    return;
+  }
+
+  IDXGIAdapter1 *adapter = adapter_by_luid(channel.adapter());
+  ID3D11Device1 *device = nullptr;
+  ID3D11DeviceContext *context = nullptr;
+  bool made = adapter && make_device(adapter, device, context);
+  release(adapter);
+  if (!made) {
+    path.failed = true;
+    path.setup = "no Direct3D device on the textures' GPU";
+    return;
+  }
+  channel.use_device(device);
+
+  code_reader_t reader;
+  uint32_t generation = 0;
+  while (!stop) {
+    luzvda::frames::consumer_t::frame_t frame;
+    auto result = channel.next(250, frame);
+    if (result == luzvda::frames::consumer_t::result_e::timeout) {
+      continue;
+    }
+    if (result == luzvda::frames::consumer_t::result_e::closed) {
+      path.setup += "; the display was removed";
+      break;
+    }
+    if (result == luzvda::frames::consumer_t::result_e::failed) {
+      path.failed = true;
+      path.setup += "; taking a frame failed, " + hex(channel.error());
+      break;
+    }
+
+    int64_t available = frame.ready_qpc ? frame.ready_qpc : qpc_now();
+    if (frame.generation != generation) {
+      if (generation) {
+        path.restarts.push_back(available);
+      }
+      generation = frame.generation;
+    }
+    bool copied = reader.copy(device, context, frame.texture);
+    channel.release(frame);
+    path.frames++;
+
+    uint64_t code = 0;
+    bool ok = copied && reader.read(context, code);
+    int64_t read = qpc_now();
+    if (!ok) {
+      path.undecoded++;
+      continue;
+    }
+    path.samples.push_back({code, available, read, frame.acquired_qpc, frame.copied_qpc, 0});
+  }
+
+  const LUZVDA_FRAME_HEADER *h = channel.header();
+  char text[256];
+  std::snprintf(text, sizeof(text), "the driver copied %llu, dropped %llu (no free slot); generation %u, %ux%u, DXGI format %u; last error %s",
+    (unsigned long long) h->frames_copied, (unsigned long long) h->frames_dropped, h->generation, h->width, h->height, h->dxgi_format, hex((HRESULT) h->last_error).c_str());
+  path.counters = text;
+  path.setup = std::string("header and event opened by ") + channel.header_opened_by() + ", textures by " + channel.textures_opened_by() + path.setup;
+
+  channel.close();
+  release(context);
+  release(device);
+}
+
+// The output whose GDI name is gdi_name, and its adapter
+static bool find_output(const std::wstring &gdi_name, IDXGIAdapter1 *&adapter_out, IDXGIOutput1 *&output_out) {
+  IDXGIFactory1 *factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **) &factory))) {
+    return false;
+  }
+  IDXGIAdapter1 *adapter = nullptr;
+  for (UINT a = 0; !output_out && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+    IDXGIOutput *output = nullptr;
+    for (UINT o = 0; !output_out && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+      DXGI_OUTPUT_DESC desc;
+      if (SUCCEEDED(output->GetDesc(&desc)) && gdi_name == desc.DeviceName && SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput1), (void **) &output_out))) {
+        adapter_out = adapter;
+        adapter->AddRef();
+      }
+      output->Release();
+    }
+    adapter->Release();
+  }
+  factory->Release();
+  return output_out != nullptr;
+}
+
+static void run_duplication(const std::wstring &gdi_name, capture_path_t &path, const std::atomic<bool> &stop) {
+  IDXGIAdapter1 *adapter = nullptr;
+  IDXGIOutput1 *output = nullptr;
+  if (!find_output(gdi_name, adapter, output)) {
+    path.failed = true;
+    path.setup = "no DXGI output for the display";
+    return;
+  }
+  ID3D11Device1 *device = nullptr;
+  ID3D11DeviceContext *context = nullptr;
+  bool made = make_device(adapter, device, context);
+  release(adapter);
+  if (!made) {
+    release(output);
+    path.failed = true;
+    path.setup = "no Direct3D device on the display's GPU";
+    return;
+  }
+
+  // As Apollo does: FP16 when the display is in HDR, 8-bit otherwise
+  IDXGIOutput5 *output5 = nullptr;
+  output->QueryInterface(__uuidof(IDXGIOutput5), (void **) &output5);
+  IDXGIOutputDuplication *duplication = nullptr;
+  auto duplicate = [&]() {
+    if (output5) {
+      const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM};
+      return output5->DuplicateOutput1(device, 0, 2, formats, &duplication);
+    }
+    return output->DuplicateOutput(device, &duplication);
+  };
+  HRESULT hr = duplicate();
+  if (FAILED(hr)) {
+    path.failed = true;
+    path.setup = (output5 ? "DuplicateOutput1 failed, " : "DuplicateOutput failed, ") + hex(hr) + (hr == E_ACCESSDENIED ? " (the desktop is locked or on the secure desktop?)" : "");
+  } else {
+    path.setup = output5 ? "DuplicateOutput1 (FP16 or 8-bit)" : "DuplicateOutput (8-bit)";
+  }
+
+  code_reader_t reader;
+  while (!stop && duplication) {
+    DXGI_OUTDUPL_FRAME_INFO info;
+    IDXGIResource *resource = nullptr;
+    hr = duplication->AcquireNextFrame(250, &info, &resource);
+    int64_t available = qpc_now();
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+      continue;
+    }
+    if (FAILED(hr)) {
+      // ACCESS_LOST on a mode or HDR change, a full-screen program or the secure desktop: start over
+      path.restarts.push_back(available);
+      release(duplication);
+      while (!stop && FAILED(duplicate())) {
+        Sleep(20);
+      }
+      continue;
+    }
+
+    if (info.LastPresentTime.QuadPart == 0) {
+      // Only the pointer changed
+      release(resource);
+      duplication->ReleaseFrame();
+      continue;
+    }
+
+    ID3D11Texture2D *frame = nullptr;
+    bool copied = SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **) &frame)) && reader.copy(device, context, frame);
+    release(frame);
+    release(resource);
+    duplication->ReleaseFrame();
+    path.frames++;
+
+    uint64_t code = 0;
+    bool ok = copied && reader.read(context, code);
+    int64_t read = qpc_now();
+    if (!ok) {
+      path.undecoded++;
+      continue;
+    }
+    path.samples.push_back({code, available, read, 0, 0, info.LastPresentTime.QuadPart});
+  }
+
+  release(duplication);
+  release(output5);
+  release(output);
+  release(context);
+  release(device);
+}
+
+// A small window on the display that draws the code, one new value per frame
+struct pattern_window_t {
+  HWND hwnd = nullptr;
+  ID3D11Device1 *device = nullptr;
+  ID3D11DeviceContext *context = nullptr;
+  ID3D11DeviceContext1 *context1 = nullptr;
+  IDXGISwapChain1 *chain = nullptr;
+  ID3D11RenderTargetView *target = nullptr;
+  // The window's client area starts here, in the display's pixels
+  int origin_x = luzvda::frame_code::k_left - 16;
+  int origin_y = luzvda::frame_code::k_top - 16;
+
+  ~pattern_window_t() {
+    release(target);
+    release(chain);
+    release(context1);
+    release(context);
+    release(device);
+    if (hwnd) {
+      DestroyWindow(hwnd);
+    }
+  }
+
+  std::string create(const RECT &monitor) {
+    namespace fc = luzvda::frame_code;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"LuzVDACaptureTest";
+    RegisterClassW(&wc);
+    int width = fc::k_width + 32;
+    int height = fc::k_height + 32;
+    hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"LuzVDA capture test", WS_POPUP, monitor.left + origin_x, monitor.top + origin_y, width, height, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+      return "creating the window failed, error " + std::to_string(GetLastError());
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    if (!make_device(nullptr, device, context) || FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **) &context1))) {
+      return "no Direct3D 11.1 device to draw with";
+    }
+    D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
+    device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options));
+    if (!options.ClearView) {
+      return "the GPU can't ClearView, which drawing the code needs";
+    }
+
+    IDXGIDevice *dxgi_device = nullptr;
+    IDXGIAdapter *adapter = nullptr;
+    IDXGIFactory2 *factory = nullptr;
+    HRESULT hr = device->QueryInterface(__uuidof(IDXGIDevice), (void **) &dxgi_device);
+    if (SUCCEEDED(hr)) {
+      hr = dxgi_device->GetAdapter(&adapter);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = adapter->GetParent(__uuidof(IDXGIFactory2), (void **) &factory);
+    }
+    if (SUCCEEDED(hr)) {
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      desc.Width = (UINT) width;
+      desc.Height = (UINT) height;
+      desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = 2;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      hr = factory->CreateSwapChainForHwnd(device, hwnd, &desc, nullptr, nullptr, &chain);
+    }
+    release(factory);
+    release(adapter);
+    release(dxgi_device);
+    ID3D11Texture2D *buffer = nullptr;
+    if (SUCCEEDED(hr)) {
+      hr = chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **) &buffer);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = device->CreateRenderTargetView(buffer, nullptr, &target);
+    }
+    release(buffer);
+    return SUCCEEDED(hr) ? "" : "making the window's swap chain failed, " + hex(hr);
+  }
+
+  // Draws the current time as the code and presents it at the next refresh; returns the code
+  uint64_t draw() {
+    const float black[4] = {0, 0, 0, 1};
+    const float white[4] = {1, 1, 1, 1};
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->ClearRenderTargetView(target, black);
+    uint64_t code = (uint64_t) qpc_now();
+    std::vector<D3D11_RECT> rects;
+    for (const auto &r : luzvda::frame_code::white_blocks(code)) {
+      rects.push_back({r.left - origin_x, r.top - origin_y, r.right - origin_x, r.bottom - origin_y});
+    }
+    context1->ClearView(target, white, rects.data(), (UINT) rects.size());
+    chain->Present(1, 0);
+    return code;
+  }
+};
+
+static bool monitor_rect(const std::wstring &gdi_name, RECT &out) {
+  struct search_t {
+    const std::wstring *name;
+    RECT rect;
+    bool found;
+  } search = {&gdi_name, {}, false};
+  EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+    auto *s = (search_t *) data;
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info) && *s->name == info.szDevice) {
+      s->rect = info.rcMonitor;
+      s->found = true;
+      return FALSE;
+    }
+    return TRUE;
+  }, (LPARAM) &search);
+  out = search.rect;
+  return search.found;
+}
+
+static bool set_hdr(const LUZVDA_LIST_ENTRY &entry, bool on) {
+  active_display_t active;
+  if (!find_active(entry, active)) {
+    return false;
+  }
+  DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE state = {};
+  state.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+  state.header.size = sizeof(state);
+  state.header.adapterId = active.path.targetInfo.adapterId;
+  state.header.id = active.path.targetInfo.id;
+  state.enableAdvancedColor = on;
+  return DisplayConfigSetDeviceInfo(&state.header) == ERROR_SUCCESS;
+}
+
+static bool enable_privilege(const wchar_t *name) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    return false;
+  }
+  TOKEN_PRIVILEGES privileges = {};
+  privileges.PrivilegeCount = 1;
+  privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  bool ok = LookupPrivilegeValueW(nullptr, name, &privileges.Privileges[0].Luid) && AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+  CloseHandle(token);
+  return ok;
+}
+
+static double percentile(std::vector<double> values, double p) {
+  if (values.empty()) {
+    return 0;
+  }
+  std::sort(values.begin(), values.end());
+  size_t i = (size_t) std::lround(p / 100.0 * (double) (values.size() - 1));
+  return values[std::min(i, values.size() - 1)];
+}
+
+static std::string spread(const std::vector<double> &values) {
+  if (values.empty()) {
+    return "none";
+  }
+  char out[128];
+  std::snprintf(out, sizeof(out), "p50 %.2f, p95 %.2f, p99 %.2f, max %.2f ms", percentile(values, 50), percentile(values, 95), percentile(values, 99), percentile(values, 100));
+  return out;
+}
+
+// The samples worth counting: each code once, from after the warm-up
+static std::vector<capture_sample_t> unique_samples(const capture_path_t &path, int64_t from) {
+  std::vector<capture_sample_t> out;
+  std::unordered_set<uint64_t> seen;
+  for (const auto &s : path.samples) {
+    if ((int64_t) s.code >= from && seen.insert(s.code).second) {
+      out.push_back(s);
+    }
+  }
+  return out;
+}
+
+// The longest wait for a new frame in [from, to), in ms
+static double longest_gap(const std::vector<capture_sample_t> &samples, int64_t from, int64_t to, double ms_per_tick) {
+  int64_t last = from;
+  double longest = 0;
+  for (const auto &s : samples) {
+    if (s.available < from || s.available >= to) {
+      continue;
+    }
+    longest = std::max(longest, (double) (s.available - last) * ms_per_tick);
+    last = s.available;
+  }
+  return std::max(longest, (double) (to - last) * ms_per_tick);
+}
+
+static void report_path(const capture_path_t &path, int64_t from, int64_t to, uint64_t presented, const std::vector<int64_t> &toggles, double ms_per_tick) {
+  std::printf("\n%s: %s\n", path.name, path.setup.c_str());
+  if (!path.enabled) {
+    std::printf("  not run\n");
+    return;
+  }
+  auto samples = unique_samples(path, from);
+  std::vector<double> available, read, to_driver, driver_copy, to_wake, to_present;
+  for (const auto &s : samples) {
+    available.push_back((double) (s.available - (int64_t) s.code) * ms_per_tick);
+    read.push_back((double) (s.read - (int64_t) s.code) * ms_per_tick);
+    if (s.driver_acquired) {
+      to_driver.push_back((double) (s.driver_acquired - (int64_t) s.code) * ms_per_tick);
+      driver_copy.push_back((double) (s.driver_copied - s.driver_acquired) * ms_per_tick);
+      to_wake.push_back((double) (s.available - s.driver_copied) * ms_per_tick);
+    }
+    if (s.presented) {
+      to_present.push_back((double) (s.presented - (int64_t) s.code) * ms_per_tick);
+    }
+  }
+  std::printf("  frames taken %llu, codes read %zu after the warm-up (%.1f%% of the %llu presented), unreadable %llu\n", (unsigned long long) path.frames, samples.size(), presented ? 100.0 * (double) samples.size() / (double) presented : 0.0, (unsigned long long) presented, (unsigned long long) path.undecoded);
+  std::printf("  presented -> available: %s\n", spread(available).c_str());
+  std::printf("  presented -> pixels on the CPU: %s\n", spread(read).c_str());
+  if (!to_driver.empty()) {
+    std::printf("  presented -> driver has it: %s\n", spread(to_driver).c_str());
+    std::printf("  driver queues the copy: %s\n", spread(driver_copy).c_str());
+    std::printf("  copy queued -> consumer wakes: %s\n", spread(to_wake).c_str());
+  }
+  if (!to_present.empty()) {
+    std::printf("  presented -> Windows' LastPresentTime: %s\n", spread(to_present).c_str());
+  }
+  std::printf("  longest wait for a new frame: %.1f ms\n", longest_gap(samples, from, to, ms_per_tick));
+  std::printf("  started over %zu times\n", path.restarts.size());
+  for (size_t i = 0; i < toggles.size(); ++i) {
+    int64_t end = std::min(to, toggles[i] + (int64_t) (5000.0 / ms_per_tick));
+    std::printf("  HDR switch %zu: longest wait in the 5 s after it %.1f ms\n", i + 1, longest_gap(samples, toggles[i], end, ms_per_tick));
+  }
+  if (!path.counters.empty()) {
+    std::printf("  %s\n", path.counters.c_str());
+  }
+}
+
+static int cmd_capture_test(int argc, char **argv) {
+  LUZVDA_GUID guid;
+  if (argc < 3 || !parse_guid(argv[2], guid)) {
+    std::fprintf(stderr, "capture-test needs a GUID\n");
+    return 2;
+  }
+  double seconds = 20;
+  double toggle_every = 0;
+  bool add = false;
+  bool debug_privilege = false;
+  std::string only;
+  for (int i = 3; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
+      seconds = std::atof(argv[++i]);
+    } else if (std::strcmp(argv[i], "--hdr-switch-every") == 0 && i + 1 < argc) {
+      toggle_every = std::atof(argv[++i]);
+    } else if (std::strcmp(argv[i], "--add") == 0) {
+      add = true;
+    } else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+      only = argv[++i];
+    } else if (std::strcmp(argv[i], "--debug-privilege") == 0) {
+      debug_privilege = true;
+    } else {
+      std::fprintf(stderr, "Unknown option %s\n", argv[i]);
+      return 2;
+    }
+  }
+  if (seconds < 3 || (!only.empty() && only != "channel" && only != "duplication")) {
+    std::fprintf(stderr, "--seconds is at least 3, and --only is channel or duplication\n");
+    return 2;
+  }
+
+  // One window pixel per display pixel, whatever the display's scale
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (debug_privilege) {
+    std::printf("SeDebugPrivilege: %s\n", enable_privilege(L"SeDebugPrivilege") ? "enabled" : "not enabled");
+  }
+
+  device_t device;
+  if (!device.ok()) {
+    return 1;
+  }
+  LUZVDA_VERSION version = {};
+  request(device.handle, IOCTL_LUZVDA_GET_VERSION, nullptr, 0, &version, sizeof(version), "Reading the version");
+  std::printf("LuzVDA %u.%u.%u.%u, protocol %u.%u\n", version.driver[0], version.driver[1], version.driver[2], version.driver[3], version.major, version.minor);
+
+  if (add) {
+    // As Apollo does: render on the GPU with the most memory, then a MacBook Pro-like display
+    char *set_adapter[] = {argv[0], (char *) "set-adapter", (char *) "auto"};
+    cmd_set_adapter(3, set_adapter);
+
+    LUZVDA_DISPLAY_DESC desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.struct_size = sizeof(desc);
+    desc.monitor_guid = guid;
+    std::snprintf(desc.name, sizeof(desc.name), "Capture test");
+    desc.width_mm = 302;
+    desc.height_mm = 196;
+    const uint16_t p3[8] = {696, 328, 271, 707, 154, 61, 320, 337};
+    std::memcpy(desc.primaries, p3, sizeof(p3));
+    desc.flags = LUZVDA_DISPLAY_HDR;
+    desc.max_luminance = 1600;
+    desc.max_full_frame_luminance = 1000;
+    desc.min_luminance = 50;
+    desc.mode_count = 3;
+    desc.modes[0] = {3024, 1964, 120000};
+    desc.modes[1] = {3024, 1890, 120000};
+    desc.modes[2] = {3024, 1964, 60000};
+    LUZVDA_ADD_OUT out = {};
+    if (!request(device.handle, IOCTL_LUZVDA_ADD_DISPLAY, &desc, sizeof(desc), &out, sizeof(out), "Adding the display")) {
+      return 1;
+    }
+  }
+
+  // Wait for Windows to make the display active
+  LUZVDA_LIST_ENTRY entry = {};
+  active_display_t active;
+  bool found = false;
+  for (int i = 0; i < 50 && !found; ++i) {
+    request(device.handle, IOCTL_LUZVDA_PING, nullptr, 0, nullptr, 0, "Pinging");
+    LUZVDA_LIST list;
+    if (list_displays(device.handle, list)) {
+      for (uint32_t d = 0; d < list.count; ++d) {
+        if (std::memcmp(list.displays[d].monitor_guid.bytes, guid.bytes, 16) == 0) {
+          entry = list.displays[d];
+          found = find_active(entry, active);
+        }
+      }
+    }
+    if (!found) {
+      Sleep(100);
+    }
+  }
+  int status = 0;
+  RECT monitor = {};
+  if (!found || !monitor_rect(active.gdi_name, monitor)) {
+    std::fprintf(stderr, "The display isn't active in Windows (add it, or pass --add)\n");
+    status = 1;
+  }
+
+  pattern_window_t window;
+  if (!status) {
+    // Let Windows settle after adding the display
+    for (int i = 0; i < 20; ++i) {
+      request(device.handle, IOCTL_LUZVDA_PING, nullptr, 0, nullptr, 0, "Pinging");
+      Sleep(100);
+    }
+    monitor_rect(active.gdi_name, monitor);
+    std::printf("Display %ls: %ldx%ld at %ld,%ld, %.3f Hz\n", active.gdi_name.c_str(), monitor.right - monitor.left, monitor.bottom - monitor.top, monitor.left, monitor.top, rate_hz(active.path.targetInfo.refreshRate));
+    std::string error = window.create(monitor);
+    if (!error.empty()) {
+      std::fprintf(stderr, "The code's window: %s\n", error.c_str());
+      status = 1;
+    }
+  }
+
+  if (!status) {
+    capture_path_t channel;
+    channel.name = "Frame channel";
+    channel.enabled = only.empty() || only == "channel";
+    capture_path_t duplication;
+    duplication.name = "Desktop Duplication";
+    duplication.enabled = only.empty() || only == "duplication";
+
+    double ms_per_tick = 1000.0 / (double) qpc_frequency();
+    std::atomic<bool> stop{false};
+
+    // Something on the display first, so the paths have frames from the start
+    for (int i = 0; i < 30; ++i) {
+      window.draw();
+    }
+    std::thread channel_thread, duplication_thread;
+    if (channel.enabled) {
+      channel_thread = std::thread(run_channel, device.handle, std::cref(guid), std::ref(channel), std::cref(stop));
+    }
+    if (duplication.enabled) {
+      duplication_thread = std::thread(run_duplication, std::cref(active.gdi_name), std::ref(duplication), std::cref(stop));
+    }
+
+    int64_t start = qpc_now();
+    int64_t warm = start + (int64_t) (1000.0 / ms_per_tick);
+    int64_t end = start + (int64_t) (seconds * 1000.0 / ms_per_tick);
+    int64_t next_ping = start;
+    int64_t next_toggle = toggle_every > 0 ? start + (int64_t) (toggle_every * 1000.0 / ms_per_tick) : INT64_MAX;
+    bool hdr_on = true;
+    uint64_t presented = 0;
+    std::vector<int64_t> toggles;
+    for (int64_t now = start; now < end; now = qpc_now()) {
+      MSG msg;
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
+      if ((int64_t) window.draw() >= warm) {
+        presented++;
+      }
+      if (now >= next_ping) {
+        request(device.handle, IOCTL_LUZVDA_PING, nullptr, 0, nullptr, 0, "Pinging");
+        next_ping = now + (int64_t) (1000.0 / ms_per_tick);
+      }
+      if (now >= next_toggle) {
+        hdr_on = !hdr_on;
+        toggles.push_back(qpc_now());
+        std::printf("HDR %s: %s\n", hdr_on ? "on" : "off", set_hdr(entry, hdr_on) ? "ok" : "failed");
+        next_toggle = now + (int64_t) (toggle_every * 1000.0 / ms_per_tick);
+      }
+    }
+    int64_t finished = qpc_now();
+    stop = true;
+    if (channel_thread.joinable()) {
+      channel_thread.join();
+    }
+    if (duplication_thread.joinable()) {
+      duplication_thread.join();
+    }
+    if (!hdr_on) {
+      set_hdr(entry, true);
+    }
+
+    std::printf("\nThe window presented %llu frames in %.1f s after a 1 s warm-up (%.1f per second)\n", (unsigned long long) presented, (double) (finished - warm) * ms_per_tick / 1000.0, (double) presented * 1000.0 / ((double) (finished - warm) * ms_per_tick));
+    report_path(channel, warm, finished, presented, toggles, ms_per_tick);
+    report_path(duplication, warm, finished, presented, toggles, ms_per_tick);
+
+    // The same frames through both: which had each first
+    auto a = unique_samples(channel, warm);
+    auto b = unique_samples(duplication, warm);
+    std::unordered_map<uint64_t, int64_t> by_code;
+    for (const auto &s : b) {
+      by_code[s.code] = s.available;
+    }
+    std::vector<double> lead;
+    for (const auto &s : a) {
+      auto it = by_code.find(s.code);
+      if (it != by_code.end()) {
+        lead.push_back((double) (s.available - it->second) * ms_per_tick);
+      }
+    }
+    std::printf("\nFrames both paths took: %zu. Frame channel minus Desktop Duplication, when each had the frame (negative: the channel first): %s\n", lead.size(), spread(lead).c_str());
+
+    std::vector<double> ca, da;
+    for (const auto &s : a) {
+      ca.push_back((double) (s.available - (int64_t) s.code) * ms_per_tick);
+    }
+    for (const auto &s : b) {
+      da.push_back((double) (s.available - (int64_t) s.code) * ms_per_tick);
+    }
+    std::printf("RESULT channel=%s duplication=%s presented=%llu channel_frames=%zu duplication_frames=%zu channel_p50_ms=%.2f duplication_p50_ms=%.2f channel_p95_ms=%.2f duplication_p95_ms=%.2f channel_restarts=%zu duplication_restarts=%zu\n",
+      !channel.enabled ? "skipped" : channel.failed ? "failed" : "ok", !duplication.enabled ? "skipped" : duplication.failed ? "failed" : "ok",
+      (unsigned long long) presented, a.size(), b.size(), percentile(ca, 50), percentile(da, 50), percentile(ca, 95), percentile(da, 95), channel.restarts.size(), duplication.restarts.size());
+    if ((channel.enabled && channel.failed) || (duplication.enabled && duplication.failed)) {
+      status = 1;
+    }
+  }
+
+  if (add) {
+    request(device.handle, IOCTL_LUZVDA_REMOVE_DISPLAY, &guid, sizeof(guid), nullptr, 0, "Removing the display");
+  }
+  return status;
+}
+
+#pragma endregion
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     usage();
@@ -861,6 +1664,7 @@ int main(int argc, char **argv) {
   if (cmd == "hdr") return cmd_hdr(argc, argv);
   if (cmd == "set-adapter") return cmd_set_adapter(argc, argv);
   if (cmd == "ping") return cmd_ping();
+  if (cmd == "capture-test") return cmd_capture_test(argc, argv);
   if (cmd == "install" && argc >= 3) return cmd_install(argv[2]);
   if (cmd == "uninstall") return cmd_uninstall();
   if (cmd == "remove-legacy") return cmd_remove_legacy();

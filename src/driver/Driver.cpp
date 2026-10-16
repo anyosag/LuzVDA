@@ -579,8 +579,8 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
-	: m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent, std::shared_ptr<FrameChannel> Frames)
+	: m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent), m_Frames(std::move(Frames))
 {
 	m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
@@ -615,6 +615,12 @@ void SwapChainProcessor::Run()
 
 	HRESULT hr = RunCore();
 	TraceLoggingWrite(g_Provider, "SwapChainEnded", TraceLoggingHexInt32(hr, "Result"));
+
+	// The frame channel's textures were made on this swap chain's device
+	if (m_Frames)
+	{
+		m_Frames->DropDevice(m_Device->Device.Get());
+	}
 
 	// Always delete the swap-chain object when swap-chain processing loop terminates in order to kick the system to
 	// provide a new swap-chain if necessary.
@@ -689,8 +695,32 @@ HRESULT SwapChainProcessor::RunCore()
 			// We have new frame to process, the surface has a reference on it that the driver has to release
 			AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
 
-			// The frame isn't used: Apollo captures the display through Windows. Frames go straight to
-			// Apollo only in a later version.
+			// A copy for whoever opened the frame channel, if anyone has lately
+			if (m_Frames)
+			{
+				LARGE_INTEGER acquired;
+				QueryPerformanceCounter(&acquired);
+				m_Frames->Publish(m_Device->Device.Get(), m_Device->DeviceContext.Get(), m_Device->AdapterLuid, AcquiredBuffer.Get(), acquired.QuadPart);
+
+				auto change = m_Frames->TakeChange();
+				if (change.kind == FrameChannel::Change::Made)
+				{
+					TraceLoggingWrite(g_Provider, "FrameTexturesMade",
+						TraceLoggingUInt32(change.generation, "Generation"),
+						TraceLoggingUInt32(change.width, "Width"),
+						TraceLoggingUInt32(change.height, "Height"),
+						TraceLoggingUInt32(change.format, "Format"),
+						TraceLoggingHexUInt32(change.names, "Names"));
+				}
+				else if (change.kind == FrameChannel::Change::Failed)
+				{
+					TraceLoggingWrite(g_Provider, "FrameTexturesFailed",
+						TraceLoggingHexInt32(change.hr, "Result"),
+						TraceLoggingUInt32(change.width, "Width"),
+						TraceLoggingUInt32(change.height, "Height"),
+						TraceLoggingUInt32(change.format, "Format"));
+				}
+			}
 
 			// We have finished processing this frame hence we release the reference on it.
 			// If the driver forgets to release the reference to the surface, it will be leaked which results in the
@@ -1007,7 +1037,7 @@ NTSTATUS IndirectDeviceContext::UpdateModes(const LUZVDA_UPDATE_MODES& Update)
 }
 
 IndirectMonitorContext::IndirectMonitorContext(const LUZVDA_DISPLAY_DESC& Desc, uint32_t Serial, UINT Connector) :
-	desc(Desc), serial(Serial), connector(Connector)
+	desc(Desc), serial(Serial), connector(Connector), frames(std::make_shared<FrameChannel>(Desc.monitor_guid))
 {
 	luzvda::edid::input_t in;
 	in.serial = Serial;
@@ -1055,7 +1085,7 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_MONITOR MonitorObject, IDDCX_
 	}
 
 	// Create a new swap-chain processing thread
-	m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+	m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent, frames));
 	TraceLoggingWrite(g_Provider, "SwapChainAssigned",
 		TraceLoggingUInt32(connector, "Connector"),
 		TraceLoggingUInt32(RenderAdapter.LowPart, "LuidLow"),
@@ -1494,6 +1524,46 @@ VOID LuzVDAIoDeviceControl(
 			LUID adapter = {luid.low, luid.high};
 			Status = pDevice ? pDevice->SetRenderAdapter(adapter) : STATUS_DEVICE_NOT_READY;
 		}
+		break;
+	}
+	case IOCTL_LUZVDA_OPEN_FRAME_CHANNEL: {
+		ResetWatchdog();
+
+		LUZVDA_GUID guid;
+		Status = ReadInput(Request, InputBufferLength, guid);
+		if (!NT_SUCCESS(Status))
+		{
+			break;
+		}
+
+		std::shared_ptr<FrameChannel> channel;
+		UINT connector = 0;
+		{
+			std::lock_guard<std::mutex> lg(g_Registry.lock);
+			auto* m = g_Registry.FindByGuid(guid);
+			if (m && m->arrived)
+			{
+				channel = m->frames;
+				connector = m->connector;
+			}
+		}
+		if (!channel)
+		{
+			Status = STATUS_NOT_FOUND;
+			break;
+		}
+
+		LUZVDA_FRAME_CHANNEL out = {};
+		HRESULT hr = channel->Open(out);
+		TraceLoggingWrite(g_Provider, "FrameChannelOpened",
+			TraceLoggingUInt32(connector, "Connector"),
+			TraceLoggingHexInt32(hr, "Result"));
+		if (FAILED(hr))
+		{
+			Status = hr == E_ACCESSDENIED || hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
+			break;
+		}
+		Status = WriteOutput(Request, out, bytesReturned);
 		break;
 	}
 	case IOCTL_LUZVDA_LIST_DISPLAYS: {

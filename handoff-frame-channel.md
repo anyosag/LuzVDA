@@ -27,8 +27,8 @@ The questions:
 
 ## For the owner
 
-1. In this PC session, approve once (the session asks).
-2. **When you leave, leave the PC signed in and unlocked** (don't press Win+L).
+1. **Approve in this PC session as you leave** (it asks now; your approval is its signal to start, so don't approve while you're still using the PC).
+2. **Leave the PC signed in and unlocked** (don't press Win+L).
    - Desktop Duplication can't capture the lock screen from here, and the test window can't draw on it.
    - The session keeps the PC awake while it works, and locks it when done.
 3. Nothing else. Results reach the Cloud session, which reports to you there.
@@ -36,9 +36,9 @@ The questions:
 ## Rules
 
 1. **Approval.** Ask the owner once, in two lines:
-   > Frame channel test: sign the test driver 0.0.0.N with your key (no release), stop Apollo, install it, run 7 capture tests (~15 min, a virtual display appears), put 0.0.0.9 back, restart Apollo, lock the PC. Start when you've left and the build is ready. Approve all?
+   > Frame channel test: sign the test driver 0.0.0.N with your key (no release), stop Apollo, install it, run 7 capture tests (~15 min, a virtual display appears), put 0.0.0.9 back, restart Apollo, lock the PC. **Approve as you leave**: I start then, leave the PC unlocked. Approve all?
 
-   With a yes, don't ask again unless something unexpected happens.
+   The owner's yes means they've left. Don't ask again unless something unexpected happens.
 2. **Start only when all of these hold:**
    - the owner approved;
    - `BUILD READY` arrived from Cloud;

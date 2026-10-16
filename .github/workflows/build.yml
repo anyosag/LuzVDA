@@ -94,14 +94,15 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSDIR=%%i
           call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
-          cl /nologo /std:c++17 /EHsc /O2 /W4 /Iinclude tools\luzvda-ctl\luzvda-ctl.cpp /Fe:luzvda-ctl.exe setupapi.lib newdev.lib dxgi.lib ole32.lib user32.lib || exit /b 1
+          cl /nologo /std:c++17 /EHsc /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Iinclude tools\luzvda-ctl\luzvda-ctl.cpp /Fe:luzvda-ctl.exe setupapi.lib newdev.lib dxgi.lib ole32.lib user32.lib || exit /b 1
 
       # Unsigned: the owner signs with their own key on their own PC (scripts/sign-package.ps1)
       - name: Package
         shell: pwsh
         run: |
-          $cat = Get-ChildItem -Recurse -Path src\driver -Filter luzvda.cat | Select-Object -First 1
-          if (-not $cat) { Get-ChildItem -Recurse src\driver\x64 | Select-Object FullName; throw 'No luzvda.cat in the build output' }
+          # The solution builds into x64\Release, and the driver package into its LuzVDA folder
+          $cat = Get-ChildItem -Recurse -Path x64\Release -Filter luzvda.cat | Select-Object -First 1
+          if (-not $cat) { Get-ChildItem -Recurse x64 | Select-Object FullName; throw 'No luzvda.cat in the build output' }
           $pkg = $cat.Directory.FullName
           Get-ChildItem $pkg | Format-Table Name, Length
 

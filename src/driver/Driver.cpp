@@ -928,15 +928,20 @@ NTSTATUS IndirectDeviceContext::AddDisplay(const LUZVDA_DISPLAY_DESC& Desc, LUZV
 	// Tell the OS that the monitor has been plugged in
 	IDARG_OUT_MONITORARRIVAL ArrivalOut;
 	Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
-
-	std::lock_guard<std::mutex> lg(g_Registry.lock);
 	if (!NT_SUCCESS(Status))
 	{
-		// Don't leave a half-made monitor that a retry would mistake for a working one
-		g_Registry.Unregister(pContext);
+		// Don't leave a half-made monitor that a retry would mistake for a working one. Deleting the
+		// object deletes its context, through the cleanup callback.
+		{
+			std::lock_guard<std::mutex> lg(g_Registry.lock);
+			g_Registry.Unregister(pContext);
+		}
+		WdfObjectDelete(MonitorCreateOut.MonitorObject);
 		TraceLoggingWrite(g_Provider, "MonitorArrivalFailed", TraceLoggingHexInt32(Status, "Status"));
 		return Status;
 	}
+
+	std::lock_guard<std::mutex> lg(g_Registry.lock);
 
 	pContext->adapterLuid = ArrivalOut.OsAdapterLuid;
 	pContext->targetId = ArrivalOut.OsTargetId;

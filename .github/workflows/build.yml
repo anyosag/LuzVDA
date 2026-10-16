@@ -129,7 +129,8 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
         with:
-          name: LuzVDA-${{ steps.version.outputs.full }}-unsigned
+          # Not the zip's own name: GitHub wraps artifacts in a zip of the artifact's name
+          name: LuzVDA-${{ steps.version.outputs.full }}-ci
           path: |
             dist/*.zip
             dist/SHA256SUMS.txt

@@ -64,10 +64,12 @@ g++ -std=c++17 -Iinclude -Isrc tests/edid_builder_test.cpp -o edid_builder_test
 
 ## Signing
 
-Builds are signed by whoever installs them, with a key that never leaves their PC. On the PC, in an elevated PowerShell:
+Builds are signed by whoever installs them, with a key that never leaves their PC. You need the Windows SDK's signing tools (`signtool.exe`) and the GitHub CLI (`winget install GitHub.cli`, then `gh auth login`). On the PC, in an elevated PowerShell:
 
-1. Once: `.\scripts\new-signing-cert.ps1`. It creates a non-exportable code-signing key in the machine's certificate store, trusts it for drivers on this PC, and writes the public `luzvda.cer`.
-2. For each release: download the unsigned zip and `SHA256SUMS.txt` from CI, then run `.\sign-package.ps1 -Zip .\LuzVDA-<version>-unsigned.zip`. It checks the hash and the build provenance (`gh attestation verify`), signs with `signtool` from the Windows SDK, and writes `LuzVDA-<version>.zip`.
+1. Download the `LuzVDA-<version>-ci` artifact from a CI run and extract it. It holds `LuzVDA-<version>-unsigned.zip` and `SHA256SUMS.txt`; extract the scripts from that zip too.
+2. Let this PowerShell window run the scripts: `Set-ExecutionPolicy -Scope Process Bypass`.
+3. Once: `.\new-signing-cert.ps1`. It creates a non-exportable code-signing key in the machine's certificate store, trusts it for drivers on this PC, and writes the public `luzvda.cer`.
+4. For each release: `.\sign-package.ps1 -Zip .\LuzVDA-<version>-unsigned.zip`. It checks the hash and the build provenance (`gh attestation verify`), signs with `signtool`, and writes `LuzVDA-<version>.zip`.
 
 Any PC that trusts your certificate will install drivers and run software you sign. Install it only on your own machines.
 

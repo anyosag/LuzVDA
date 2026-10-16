@@ -161,18 +161,6 @@ struct MonitorRegistry
 		return nullptr;
 	}
 
-	IndirectMonitorContext* FindByConnector(UINT connector)
-	{
-		for (auto* m : monitors)
-		{
-			if (m->connector == connector)
-			{
-				return m;
-			}
-		}
-		return nullptr;
-	}
-
 	// Takes the monitor out, so nothing finds it any more; returns whether it was in
 	bool Unregister(IndirectMonitorContext* m)
 	{
@@ -1286,22 +1274,12 @@ NTSTATUS LuzVDAAdapterQueryTargetInfo(
 )
 {
 	UNREFERENCED_PARAMETER(AdapterObject);
+	UNREFERENCED_PARAMETER(pInArgs);
 
-	// HDR only for monitors whose screen can show it; wide color for all
-	bool hdr = true;
-	{
-		std::lock_guard<std::mutex> lg(g_Registry.lock);
-		if (auto* pContext = g_Registry.FindByConnector(pInArgs->ConnectorIndex))
-		{
-			hdr = (pContext->desc.flags & LUZVDA_DISPLAY_HDR) != 0;
-		}
-	}
-
-	pOutArgs->TargetCaps = IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE;
-	if (hdr)
-	{
-		pOutArgs->TargetCaps |= IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
-	}
+	// IddCx asks this once per connector right after the adapter starts, before any monitor exists
+	// (IddCx.h), so it can't depend on the display. Every connector can carry HDR; whether a display
+	// offers it is up to its EDID, which has HDR static metadata and BT.2020 only for HDR screens.
+	pOutArgs->TargetCaps = IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE | IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
 	pOutArgs->DitheringSupport.Rgb = g_HdrBits;
 
 	return STATUS_SUCCESS;

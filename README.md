@@ -11,7 +11,7 @@ It's a fork of [SudoVDA](https://github.com/SudoMaker/SudoVDA), built on Microso
 | Who can add or remove displays | Any program (the device was open to Everyone) | SYSTEM and Administrators |
 | What a display reports | One fixed EDID: 70×39 cm, about 3,800 nits, zero color primaries; only the name and serial change | An EDID built from the caller's description, checked with `edid-decode` |
 | Modes | 47 built-in modes plus scaled copies of the requested one | Exactly the caller's modes (up to 32), plus 1920×1080 at 60 Hz |
-| HDR | Offered on every display | Only on displays described as HDR |
+| HDR | Offered on every display | Its EDID declares HDR only for displays described as HDR (whether Windows then hides HDR on the others is still to be checked on a PC) |
 | Changing modes | Not possible without re-adding the display | `UPDATE_MODES` replaces the target modes |
 | Requests | No size or string checks | Every field checked (`src/common/validate.h`, tested) |
 | Signing | SudoMaker's self-signed certificate, added to Trusted Root by Apollo's installer | Yours, made on your PC by `scripts/new-signing-cert.ps1` |

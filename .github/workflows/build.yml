@@ -75,14 +75,19 @@ jobs:
       - name: Restore the WDK
         run: nuget restore .\packages.config -PackagesDirectory .\packages\
 
+      # MSBuild isn't on the PATH of a plain shell; vswhere, installed with Visual Studio, finds it
       - name: Build the driver
-        run: >
-          msbuild LuzVDA.sln -t:rebuild -noLogo -clp:Verbosity=m
-          -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
-          -p:LuzVdaVersionMajor=${{ steps.version.outputs.major }}
-          -p:LuzVdaVersionMinor=${{ steps.version.outputs.minor }}
-          -p:LuzVdaVersionPatch=${{ steps.version.outputs.patch }}
-          -p:LuzVdaVersionBuild=${{ steps.version.outputs.build }}
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild LuzVDA.sln -t:rebuild -noLogo -clp:Verbosity=m `
+            -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10 `
+            -p:LuzVdaVersionMajor=${{ steps.version.outputs.major }} `
+            -p:LuzVdaVersionMinor=${{ steps.version.outputs.minor }} `
+            -p:LuzVdaVersionPatch=${{ steps.version.outputs.patch }} `
+            -p:LuzVdaVersionBuild=${{ steps.version.outputs.build }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build luzvda-ctl
         shell: cmd

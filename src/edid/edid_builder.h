@@ -150,17 +150,17 @@ namespace luzvda::edid {
     d[1] = (t.pixel_clock_10khz >> 8) & 0xff;
     d[2] = t.h_active & 0xff;
     d[3] = t.h_blank & 0xff;
-    d[4] = ((t.h_active >> 8) << 4) | ((t.h_blank >> 8) & 0x0f);
+    d[4] = (uint8_t) (((t.h_active >> 8) << 4) | ((t.h_blank >> 8) & 0x0f));
     d[5] = t.v_active & 0xff;
     d[6] = t.v_blank & 0xff;
-    d[7] = ((t.v_active >> 8) << 4) | ((t.v_blank >> 8) & 0x0f);
+    d[7] = (uint8_t) (((t.v_active >> 8) << 4) | ((t.v_blank >> 8) & 0x0f));
     d[8] = t.h_front & 0xff;
     d[9] = t.h_sync & 0xff;
-    d[10] = ((t.v_front & 0x0f) << 4) | (t.v_sync & 0x0f);
-    d[11] = (((t.h_front >> 8) & 3) << 6) | (((t.h_sync >> 8) & 3) << 4) | (((t.v_front >> 4) & 3) << 2) | ((t.v_sync >> 4) & 3);
-    d[12] = width_mm & 0xff;
-    d[13] = height_mm & 0xff;
-    d[14] = (((width_mm >> 8) & 0x0f) << 4) | ((height_mm >> 8) & 0x0f);
+    d[10] = (uint8_t) (((t.v_front & 0x0f) << 4) | (t.v_sync & 0x0f));
+    d[11] = (uint8_t) ((((t.h_front >> 8) & 3) << 6) | (((t.h_sync >> 8) & 3) << 4) | (((t.v_front >> 4) & 3) << 2) | ((t.v_sync >> 4) & 3));
+    d[12] = (uint8_t) (width_mm & 0xff);
+    d[13] = (uint8_t) (height_mm & 0xff);
+    d[14] = (uint8_t) ((((width_mm >> 8) & 0x0f) << 4) | ((height_mm >> 8) & 0x0f));
     d[15] = 0;
     d[16] = 0;
     // Digital separate sync, +hsync -vsync, as reduced blanking expects
@@ -198,14 +198,14 @@ namespace luzvda::edid {
     std::memcpy(b, header, 8);
 
     uint16_t id = (uint16_t) (((manufacturer[0] - '@') << 10) | ((manufacturer[1] - '@') << 5) | (manufacturer[2] - '@'));
-    b[8] = id >> 8;
-    b[9] = id & 0xff;
+    b[8] = (uint8_t) (id >> 8);
+    b[9] = (uint8_t) (id & 0xff);
     b[10] = product_code & 0xff;
     b[11] = product_code >> 8;
     b[12] = in.serial & 0xff;
     b[13] = (in.serial >> 8) & 0xff;
     b[14] = (in.serial >> 16) & 0xff;
-    b[15] = (in.serial >> 24) & 0xff;
+    b[15] = (uint8_t) ((in.serial >> 24) & 0xff);
 
     // Fixed so the same display always gets the same bytes: week 1 of 2026
     b[16] = 1;

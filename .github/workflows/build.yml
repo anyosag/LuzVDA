@@ -39,7 +39,8 @@ jobs:
           for std in c++17 c++23; do
             x86_64-w64-mingw32-g++-posix -std=$std -Wall -Wextra -Werror -Iinclude -fsyntax-only "$RUNNER_TEMP/frames.cpp"
           done
-          x86_64-w64-mingw32-g++-posix -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc -fsyntax-only src/driver/FrameChannel.cpp
+          # As the driver build has it: no STATUS_* definitions from windows.h
+          x86_64-w64-mingw32-g++-posix -std=c++17 -Wall -Wextra -Werror -DWIN32_NO_STATUS -Iinclude -Isrc -fsyntax-only src/driver/FrameChannel.cpp
 
       - name: Unit tests
         run: |

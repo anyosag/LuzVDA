@@ -30,6 +30,10 @@ namespace
 	// Only SYSTEM (Apollo's service) and Administrators, as for the control device
 	const wchar_t c_Sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
+	// What IDXGIKeyedMutex::AcquireSync returns when the other device went away holding the mutex:
+	// WAIT_ABANDONED, whose definition the driver build leaves out (WIN32_NO_STATUS)
+	const HRESULT c_KeyedMutexAbandoned = 0x00000080L;
+
 	std::wstring Widen(const std::string& Text)
 	{
 		return std::wstring(Text.begin(), Text.end());
@@ -217,7 +221,7 @@ void FrameChannel::Publish(ID3D11Device* Device, ID3D11DeviceContext* Context, c
 
 	int slot = luzvda::frames::pick_slot(Read64(&m_Header->latest), LUZVDA_FRAME_SLOTS, [&](uint32_t i) {
 		HRESULT hr = m_Slots[i].mutex->AcquireSync(0, 0);
-		if (hr == (HRESULT)WAIT_ABANDONED)
+		if (hr == c_KeyedMutexAbandoned)
 		{
 			m_RingBroken = true;
 		}

@@ -56,7 +56,8 @@ static std::atomic<DWORD> g_WatchdogTimeout{3};
 static IDDCX_BITS_PER_COMPONENT g_SdrBits = IDDCX_BITS_PER_COMPONENT_8;
 static IDDCX_BITS_PER_COMPONENT g_HdrBits = IDDCX_BITS_PER_COMPONENT_10;
 // An experiment: a name longer than 13 characters over two EDID name descriptors
-static bool g_EdidSplitName = false;
+// Names over 13 characters go into a second EDID name descriptor; Windows 11 build 26200 shows them whole
+static bool g_EdidSplitName = true;
 
 // The GPU every monitor renders on, from the registry or a request
 static std::mutex g_AdapterLock;

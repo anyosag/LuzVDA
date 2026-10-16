@@ -11,13 +11,25 @@ It's a fork of [SudoVDA](https://github.com/SudoMaker/SudoVDA), built on Microso
 | Who can add or remove displays | Any program (the device was open to Everyone) | SYSTEM and Administrators |
 | What a display reports | One fixed EDID: 70×39 cm, about 3,800 nits, zero color primaries; only the name and serial change | An EDID built from the caller's description, checked with `edid-decode` |
 | Modes | 47 built-in modes plus scaled copies of the requested one | Exactly the caller's modes (up to 32), plus 1920×1080 at 60 Hz |
-| HDR | Offered on every display | Its EDID declares HDR only for displays described as HDR (whether Windows then hides HDR on the others is still to be checked on a PC) |
-| Changing modes | Not possible without re-adding the display | `UPDATE_MODES` replaces the target modes |
+| HDR | Offered on every display | Only on displays described as HDR: their EDID declares it, and Windows offers "Use HDR" only for those |
+| Changing modes | Not possible without re-adding the display | `UPDATE_MODES` replaces the modes, and Windows then switches to a new one without the display being re-added |
 | Requests | No size or string checks | Every field checked (`src/common/validate.h`, tested) |
 | Signing | SudoMaker's self-signed certificate, added to Trusted Root by Apollo's installer | Yours, made on your PC by `scripts/new-signing-cert.ps1` |
 | Windows | 10 and 11 | 11 24H2 (build 26100) and later only |
 
 It also fixes SudoVDA bugs: monitor contexts, EDIDs and a named event handle leaked on every display; lists were read without the lock; a full connector list blocked re-adding an existing display; a failed arrival left a half-made display behind; an invalid render GPU could abandon swap-chains forever; the EDID serial used only part of the GUID; and the manufacturer ID SMK belongs to SMK Corporation.
+
+## Tested
+
+0.0.0.7 was tested on Windows 11 build 26200 with an NVIDIA RTX 5080 and Secure Boot off: [results](https://github.com/anyosag/LuzVDA/blob/test-results/first-test/results/first-test-0.0.0.7.md).
+- Windows reads each display's brightness and primaries from its EDID: 1,600 / 994 nits and Display P3 for a MacBook Pro display.
+- A display can take new modes without being re-added.
+- Brightness isn't part of how Windows recognizes a display, so changing it keeps the display's settings.
+- Displays described without HDR get no "Use HDR".
+- The watchdog removes displays of a caller that stopped.
+- Ten adds and removes in a row leave nothing behind.
+
+Installing next to SudoVDA while Apollo holds SudoVDA open needs a restart to finish. Whether a driver signed this way installs with Secure Boot on is untested.
 
 ## Requirements
 
@@ -41,7 +53,7 @@ Under `HKLM\SOFTWARE\LuzVDA`. They're read when the driver loads, so restart the
 | `maxMonitors` | DWORD | 10 | 1 to 16 |
 | `sdrBits` | DWORD | 8 | 10 for 10-bit SDR only |
 | `hdrBits` | DWORD | 10 | 12 for 12-bit HDR only |
-| `edidSplitName` | DWORD | 0 | Experiment: spread names longer than 13 characters over two EDID name descriptors |
+| `edidSplitName` | DWORD | 1 | Names longer than 13 characters go into two EDID name descriptors, and Windows shows them whole; 0 keeps the first 13 |
 
 ## Building
 

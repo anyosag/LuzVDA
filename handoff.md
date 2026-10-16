@@ -1,6 +1,8 @@
 # Handoff: sign, install and test LuzVDA on this PC
 
-This is for **Claude Code running locally on the Windows PC** (RTX 4080, Windows 11 24H2 or later). A cloud Claude session built the driver; you run what only this PC can run, collect the results, and hand them back. You don't change the driver's code.
+> Run once, on 0.0.0.7: [results](https://github.com/anyosag/LuzVDA/blob/test-results/first-test/results/first-test-0.0.0.7.md). From the next version on, long names are on by default, so `edidSplitName` = 0 shows the 13-character form instead. When you run it, call `luzvda-ctl.exe` by its full path: some shells, Claude Code's among them, don't run programs from the current folder.
+
+This is for **Claude Code running locally on the Windows PC** (NVIDIA GPU, Windows 11 24H2 or later). A cloud Claude session built the driver; you run what only this PC can run, collect the results, and hand them back. You don't change the driver's code.
 
 ## What this is
 
@@ -131,7 +133,7 @@ luzvda-ctl.exe list
 **Expected:**
 - `install` prints `Created the LuzVDA device`, then `Installed the LuzVDA driver`. If it adds `restart Windows to finish`, ask the user before restarting.
 - `version` prints `LuzVDA 0.0.0.<run>, protocol 1.0; this tool speaks 1.0`, then `Watchdog: 3 s`.
-- `set-adapter auto` prints `Rendering on NVIDIA GeForce RTX 4080`.
+- `set-adapter auto` prints `Rendering on NVIDIA GeForce …` (the PC's GPU).
 - `list` prints `0 display(s)`.
 
 **Device check:**
@@ -186,7 +188,7 @@ luzvda-ctl diag
 - `diag` lists the display:
   - with a GDI name like `\\.\DISPLAY5`, at `3024x1964 at 120.000 Hz`;
   - `monitor name: "MacBook Pro"`;
-  - `rendered by: NVIDIA GeForce RTX 4080`.
+  - `rendered by: NVIDIA GeForce …` (the PC's GPU).
 - After `hdr … on`, `advanced color: supported 1, enabled 1`. Then the DXGI lines:
   - color space 12 (PQ / BT.2020), 10 bits;
   - luminance about **min 0.005, max 1600, max full frame 994**: the EDID stores 1000 as the nearest code, 994;

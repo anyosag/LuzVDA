@@ -1,5 +1,7 @@
 # First test on a PC
 
+> Run once, on 0.0.0.7: [results](https://github.com/anyosag/LuzVDA/blob/test-results/first-test/results/first-test-0.0.0.7.md). From the next version on, long names are on by default, so `edidSplitName` = 0 shows the 13-character form instead. When you run it, call `luzvda-ctl.exe` by its full path: some shells, Claude Code's among them, don't run programs from the current folder.
+
 LuzVDA hasn't run on a real PC yet. This installs it next to SudoVDA, so the Apollo you use today keeps working, and answers the questions Apollo's next steps depend on. Paste back everything marked **Paste**.
 
 Before you start, make a restore point (Start → "Create a restore point"). A driver that misbehaves can be removed with `luzvda-ctl uninstall`, but a restore point costs nothing.
@@ -58,7 +60,7 @@ luzvda-ctl hdr 6a0b9c1e-3f4d-4c2a-9e7b-1d2c3b4a5f60 on
 luzvda-ctl diag
 ```
 
-**Paste:** both `diag` outputs. The second should show HDR on, about 1,600 / 1,000 nits, P3 primaries, and the RTX 4080 as the render GPU.
+**Paste:** both `diag` outputs. The second should show HDR on, about 1,600 / 1,000 nits, P3 primaries, and your NVIDIA GPU as the render GPU.
 
 ## 4. Changing modes
 

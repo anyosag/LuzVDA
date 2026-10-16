@@ -613,7 +613,8 @@ void SwapChainProcessor::Run()
 	DWORD AvTask = 0;
 	HANDLE AvTaskHandle = AvSetMmThreadCharacteristicsW(L"DisplayPostProcessing", &AvTask);
 
-	RunCore();
+	HRESULT hr = RunCore();
+	TraceLoggingWrite(g_Provider, "SwapChainEnded", TraceLoggingHexInt32(hr, "Result"));
 
 	// Always delete the swap-chain object when swap-chain processing loop terminates in order to kick the system to
 	// provide a new swap-chain if necessary.
@@ -626,14 +627,14 @@ void SwapChainProcessor::Run()
 	}
 }
 
-void SwapChainProcessor::RunCore()
+HRESULT SwapChainProcessor::RunCore()
 {
 	// Get the DXGI device interface
 	ComPtr<IDXGIDevice> DxgiDevice;
 	HRESULT hr = m_Device->Device.As(&DxgiDevice);
 	if (FAILED(hr))
 	{
-		return;
+		return hr;
 	}
 
 	IDARG_IN_SWAPCHAINSETDEVICE SetDevice = {};
@@ -642,7 +643,7 @@ void SwapChainProcessor::RunCore()
 	hr = IddCxSwapChainSetDevice(m_hSwapChain, &SetDevice);
 	if (FAILED(hr))
 	{
-		return;
+		return hr;
 	}
 
 	// Acquire and release buffers in a loop
@@ -673,6 +674,7 @@ void SwapChainProcessor::RunCore()
 			else if (WaitResult == WAIT_OBJECT_0 + 1)
 			{
 				// We need to terminate
+				hr = S_OK;
 				break;
 			}
 			else
@@ -709,6 +711,8 @@ void SwapChainProcessor::RunCore()
 			break;
 		}
 	}
+
+	return hr;
 }
 
 #pragma endregion
@@ -1052,6 +1056,10 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_MONITOR MonitorObject, IDDCX_
 
 	// Create a new swap-chain processing thread
 	m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+	TraceLoggingWrite(g_Provider, "SwapChainAssigned",
+		TraceLoggingUInt32(connector, "Connector"),
+		TraceLoggingUInt32(RenderAdapter.LowPart, "LuidLow"),
+		TraceLoggingInt32(RenderAdapter.HighPart, "LuidHigh"));
 
 	// The cursor is drawn by the capture side, not composed into the frames. The event is required but
 	// never waited on; one per monitor, unnamed, closed with the monitor (SudoVDA leaked a named one
@@ -1085,6 +1093,8 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_MONITOR MonitorObject, IDDCX_
 
 void IndirectMonitorContext::UnassignSwapChain()
 {
+	TraceLoggingWrite(g_Provider, "SwapChainUnassigned", TraceLoggingUInt32(connector, "Connector"));
+
 	// Stop processing the last swap-chain
 	m_ProcessingThread.reset();
 }

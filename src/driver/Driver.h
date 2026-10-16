@@ -75,7 +75,7 @@ namespace LuzVDA
 		static DWORD CALLBACK RunThread(LPVOID Argument);
 
 		void Run();
-		void RunCore();
+		HRESULT RunCore();
 
 		IDDCX_SWAPCHAIN m_hSwapChain;
 		std::shared_ptr<Direct3DDevice> m_Device;

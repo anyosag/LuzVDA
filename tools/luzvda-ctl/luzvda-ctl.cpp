@@ -525,7 +525,7 @@ static int cmd_list(bool details) {
       print_display(list.displays[i]);
     } else {
       const auto &e = list.displays[i];
-      std::printf("%s  target %u  %ux%u at %.3f Hz\n", guid_string(e.monitor_guid).c_str(), e.target_id, e.preferred_mode.width, e.preferred_mode.height, e.preferred_mode.refresh_mhz / 1000.0);
+      std::printf("%s  target %u  preferred %ux%u at %.3f Hz\n", guid_string(e.monitor_guid).c_str(), e.target_id, e.preferred_mode.width, e.preferred_mode.height, e.preferred_mode.refresh_mhz / 1000.0);
     }
   }
   return 0;

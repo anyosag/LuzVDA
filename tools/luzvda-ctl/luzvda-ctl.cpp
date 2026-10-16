@@ -79,9 +79,12 @@ static bool parse_mode(const char *text, LUZVDA_MODE &out) {
 
 #pragma region Device
 
-static HANDLE open_device() {
+// The device for reading and writing; error is why not, taken before cleanup calls overwrite it
+static HANDLE open_device(DWORD &error) {
+  error = ERROR_FILE_NOT_FOUND;
   HDEVINFO set = SetupDiGetClassDevsW(&s_InterfaceGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
   if (set == INVALID_HANDLE_VALUE) {
+    error = GetLastError();
     return INVALID_HANDLE_VALUE;
   }
 
@@ -99,6 +102,7 @@ static HANDLE open_device() {
     detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
     if (SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, size, &size, nullptr)) {
       handle = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+      error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     }
   }
 
@@ -116,7 +120,8 @@ static bool request(HANDLE device, DWORD code, const void *in, DWORD in_size, vo
 }
 
 struct device_t {
-  HANDLE handle = open_device();
+  DWORD error = ERROR_SUCCESS;
+  HANDLE handle = open_device(error);
 
   ~device_t() {
     if (handle != INVALID_HANDLE_VALUE) {
@@ -126,7 +131,7 @@ struct device_t {
 
   bool ok() const {
     if (handle == INVALID_HANDLE_VALUE) {
-      print_error("Opening LuzVDA (installed? elevated prompt?)");
+      print_error("Opening LuzVDA (installed? elevated prompt?)", error);
       return false;
     }
     return true;

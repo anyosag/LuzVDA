@@ -4,6 +4,7 @@
 #include <dxgi.h>       	// For IDXGIAdapter, IDXGIFactory1
 #include <algorithm>    	// For sort
 #include <string>
+#include <vector>
 
 using namespace std;
 using namespace Microsoft::WRL;
@@ -16,12 +17,12 @@ struct GPUInfo {
 };
 
 // Sort function for GPUs by dedicated video memory
-bool CompareGPUs(const GPUInfo& a, const GPUInfo& b) {
+inline bool CompareGPUs(const GPUInfo& a, const GPUInfo& b) {
     return a.desc.DedicatedVideoMemory > b.desc.DedicatedVideoMemory;
 }
 
 // Get a enumerate list of available GPUs
-vector<GPUInfo> getAvailableGPUs() {
+inline vector<GPUInfo> getAvailableGPUs() {
     vector<GPUInfo> gpus; // Vector to hold all GPU's information
 
     ComPtr<IDXGIFactory1> factory;

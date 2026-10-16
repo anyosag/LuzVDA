@@ -1,0 +1,129 @@
+name: Build
+
+on:
+  push:
+    branches: [master, 'claude/**']
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The parts that don't need Windows: protocol layout, input checks, and EDIDs checked by edid-decode
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install edid-decode
+        run: sudo apt-get update && sudo apt-get install -y edid-decode
+
+      - name: Protocol header builds as C and C++
+        run: |
+          printf '#include "luzvda/luzvda-ioctl.h"\nint main(void) { return 0; }\n' > "$RUNNER_TEMP/ioctl.c"
+          gcc -std=c11 -Wall -Wextra -Werror -Iinclude "$RUNNER_TEMP/ioctl.c" -o "$RUNNER_TEMP/ioctl_c"
+          g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -x c++ "$RUNNER_TEMP/ioctl.c" -o "$RUNNER_TEMP/ioctl_cpp"
+
+      - name: Unit tests
+        run: |
+          for t in validate edid_builder; do
+            g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude -Isrc "tests/${t}_test.cpp" -o "$RUNNER_TEMP/$t"
+          done
+          "$RUNNER_TEMP/validate"
+          mkdir -p "$RUNNER_TEMP/edids"
+          "$RUNNER_TEMP/edid_builder" "$RUNNER_TEMP/edids"
+
+      - name: EDIDs conform (edid-decode --check)
+        run: |
+          for f in "$RUNNER_TEMP"/edids/*.bin; do
+            echo "== $(basename "$f")"
+            edid-decode --check "$f" | sed -n '/^Warnings:/,$p'
+          done
+
+  build:
+    needs: tests
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+
+      # A tag vX.Y.Z builds X.Y.Z.<run number>; anything else 0.0.0.<run number>
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $v = '0.0.0'
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $v = $env:GITHUB_REF_NAME.Substring(1) }
+          $p = $v.Split('.')
+          if ($p.Count -ne 3 -or ($p | Where-Object { $_ -notmatch '^\d+$' })) { throw "Tags must be vX.Y.Z, got $env:GITHUB_REF_NAME" }
+          "major=$($p[0])" >> $env:GITHUB_OUTPUT
+          "minor=$($p[1])" >> $env:GITHUB_OUTPUT
+          "patch=$($p[2])" >> $env:GITHUB_OUTPUT
+          "build=$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+          "full=$v.$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+
+      - name: Restore the WDK
+        run: nuget restore .\packages.config -PackagesDirectory .\packages\
+
+      - name: Build the driver
+        run: >
+          msbuild LuzVDA.sln -t:rebuild -noLogo -clp:Verbosity=m
+          -p:Configuration=Release -p:Platform=x64 -p:TargetVersion=Windows10
+          -p:LuzVdaVersionMajor=${{ steps.version.outputs.major }}
+          -p:LuzVdaVersionMinor=${{ steps.version.outputs.minor }}
+          -p:LuzVdaVersionPatch=${{ steps.version.outputs.patch }}
+          -p:LuzVdaVersionBuild=${{ steps.version.outputs.build }}
+
+      - name: Build luzvda-ctl
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
+          cl /nologo /std:c++17 /EHsc /O2 /W4 /Iinclude tools\luzvda-ctl\luzvda-ctl.cpp /Fe:luzvda-ctl.exe setupapi.lib newdev.lib dxgi.lib ole32.lib user32.lib || exit /b 1
+
+      # Unsigned: the owner signs with their own key on their own PC (scripts/sign-package.ps1)
+      - name: Package
+        shell: pwsh
+        run: |
+          $cat = Get-ChildItem -Recurse -Path src\driver -Filter luzvda.cat | Select-Object -First 1
+          if (-not $cat) { Get-ChildItem -Recurse src\driver\x64 | Select-Object FullName; throw 'No luzvda.cat in the build output' }
+          $pkg = $cat.Directory.FullName
+          Get-ChildItem $pkg | Format-Table Name, Length
+
+          $driverVer = (Select-String -Path "$pkg\LuzVDA.inf" -Pattern '^DriverVer\s*=').Line
+          Write-Host $driverVer
+          if ($driverVer -notmatch [regex]::Escape('${{ steps.version.outputs.full }}')) { throw "DriverVer isn't ${{ steps.version.outputs.full }}" }
+
+          $name = 'LuzVDA-${{ steps.version.outputs.full }}-unsigned'
+          $out = "dist\$name"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "$pkg\LuzVDA.inf", "$pkg\LuzVDA.dll", "$pkg\luzvda.cat" $out
+          Copy-Item luzvda-ctl.exe, include\luzvda\luzvda-ioctl.h, LICENSE, NOTICE.md $out
+          Copy-Item scripts\*.ps1 $out
+          Compress-Archive -Path "$out\*" -DestinationPath "dist\$name.zip"
+          Get-FileHash "dist\$name.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $name.zip" } | Set-Content dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: dist/*.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: LuzVDA-${{ steps.version.outputs.full }}-unsigned
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

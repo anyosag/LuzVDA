@@ -9,6 +9,9 @@ Abstract:
 
 	MSDN documentation on indirect displays can be found at https://msdn.microsoft.com/en-us/library/windows/hardware/mt761968(v=vs.85).aspx.
 
+	LuzVDA: virtual monitors created on request, each describing the screen it stands in for. Changed
+	by SudoVDA's contributors and then for LuzVDA; see NOTICE.md.
+
 Environment:
 
 	User Mode, UMDF
@@ -16,240 +19,330 @@ Environment:
 --*/
 
 #include "Driver.h"
-#include "edid.h"
 
-#include <tuple>
-#include <list>
-#include <iostream>
-#include <thread>
+#include <TraceLoggingProvider.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <mutex>
+#include <thread>
 
-#include <AdapterOption.h>
-#include <sudovda-ioctl.h>
+#include "AdapterOption.h"
+#include "common/validate.h"
+#include "edid/edid_builder.h"
 
-using namespace std;
-using namespace Microsoft::IndirectDisp;
+using namespace LuzVDA;
 using namespace Microsoft::WRL;
-using namespace SUDOVDA;
 
-LUID preferredAdapterLuid{};
-bool preferredAdapterChanged = false;
+// {fdbe20c6-12e0-4cf1-907d-e0b99b08b5ce}
+TRACELOGGING_DEFINE_PROVIDER(
+	g_Provider,
+	"LuzVDA",
+	(0xfdbe20c6, 0x12e0, 0x4cf1, 0x90, 0x7d, 0xe0, 0xb9, 0x9b, 0x08, 0xb5, 0xce));
 
-std::mutex monitorListOp;
-std::queue<size_t> freeConnectorSlots;
-std::list<IndirectMonitorContext*> monitorCtxList;
+#ifndef LUZVDA_VERSION_MAJOR
+#define LUZVDA_VERSION_MAJOR 0
+#define LUZVDA_VERSION_MINOR 0
+#define LUZVDA_VERSION_PATCH 0
+#define LUZVDA_VERSION_BUILD 0
+#endif
 
-bool isHDRSupported = false;
-bool testMode = false;
-DWORD watchdogTimeout = 3; // seconds
-DWORD watchdogCountdown = 0;
-std::thread watchdogThread;
+#pragma region Settings
 
-DWORD MaxVirtualMonitorCount = 10;
-IDDCX_BITS_PER_COMPONENT SDRBITS = IDDCX_BITS_PER_COMPONENT_8;
-IDDCX_BITS_PER_COMPONENT HDRBITS = IDDCX_BITS_PER_COMPONENT_10;
+// Read from HKLM\SOFTWARE\LuzVDA when the driver loads
+static DWORD g_MaxMonitors = 10;
+static std::atomic<DWORD> g_WatchdogTimeout{3};
+static IDDCX_BITS_PER_COMPONENT g_SdrBits = IDDCX_BITS_PER_COMPONENT_8;
+static IDDCX_BITS_PER_COMPONENT g_HdrBits = IDDCX_BITS_PER_COMPONENT_10;
+// An experiment: a name longer than 13 characters over two EDID name descriptors
+static bool g_EdidSplitName = false;
 
-#pragma region SampleMonitors
+// The GPU every monitor renders on, from the registry or a request
+static std::mutex g_AdapterLock;
+static LUID g_PreferredAdapter{};
+static bool g_PreferredAdapterPending = false;
+static int g_AbandonedSwapChains = 0;
 
-static const UINT mode_scale_factors[] = {
-	// Put 100 at the first for convenience and fool proof
-	100,
-	50,
-	75,
-	125,
-	150,
+// The IddCx adapter, once initialized
+static std::atomic<IDDCX_ADAPTER> g_Adapter{nullptr};
+
+static bool SameLuid(const LUID& a, const LUID& b)
+{
+	return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+}
+
+static bool ReadDword(HKEY Key, const wchar_t* Name, DWORD& Value)
+{
+	DWORD size = sizeof(Value);
+	return RegGetValueW(Key, nullptr, Name, RRF_RT_REG_DWORD, nullptr, &Value, &size) == ERROR_SUCCESS;
+}
+
+static void LoadSettings()
+{
+	HKEY key;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\LuzVDA", 0, KEY_READ, &key) != ERROR_SUCCESS)
+	{
+		return;
+	}
+
+	// RRF_RT_REG_SZ checks the type and guarantees the terminating NUL
+	wchar_t gpuName[128];
+	DWORD size = sizeof(gpuName);
+	if (RegGetValueW(key, nullptr, L"gpuName", RRF_RT_REG_SZ, nullptr, gpuName, &size) == ERROR_SUCCESS)
+	{
+		AdapterOption adapterOpt;
+		adapterOpt.selectGPU(gpuName);
+		if (adapterOpt.hasTargetAdapter)
+		{
+			g_PreferredAdapter = adapterOpt.adapterLuid;
+			g_PreferredAdapterPending = true;
+		}
+	}
+
+	DWORD value;
+	if (ReadDword(key, L"watchdog", value))
+	{
+		g_WatchdogTimeout = std::min<DWORD>(value, 60);
+	}
+	if (ReadDword(key, L"maxMonitors", value))
+	{
+		g_MaxMonitors = std::clamp<DWORD>(value, 1, LUZVDA_MAX_DISPLAYS);
+	}
+	if (ReadDword(key, L"sdrBits", value) && value == 10)
+	{
+		g_SdrBits = IDDCX_BITS_PER_COMPONENT_10;
+	}
+	if (ReadDword(key, L"hdrBits", value) && value == 12)
+	{
+		g_HdrBits = IDDCX_BITS_PER_COMPONENT_12;
+	}
+	if (ReadDword(key, L"edidSplitName", value))
+	{
+		g_EdidSplitName = value != 0;
+	}
+
+	RegCloseKey(key);
+}
+
+#pragma endregion
+
+#pragma region Registry
+
+// Every monitor from the add request until it is removed. IddCx calls back into the driver while
+// creating a monitor, and those callbacks take this lock, so it is never held across an IddCx call.
+struct MonitorRegistry
+{
+	std::mutex lock;
+	std::vector<IndirectMonitorContext*> monitors;
+	std::vector<bool> slotUsed;
+
+	IndirectMonitorContext* FindByGuid(const LUZVDA_GUID& guid)
+	{
+		for (auto* m : monitors)
+		{
+			if (std::memcmp(m->desc.monitor_guid.bytes, guid.bytes, sizeof(guid.bytes)) == 0)
+			{
+				return m;
+			}
+		}
+		return nullptr;
+	}
+
+	IndirectMonitorContext* FindBySerial(uint32_t serial)
+	{
+		for (auto* m : monitors)
+		{
+			if (m->serial == serial)
+			{
+				return m;
+			}
+		}
+		return nullptr;
+	}
+
+	IndirectMonitorContext* FindByConnector(UINT connector)
+	{
+		for (auto* m : monitors)
+		{
+			if (m->connector == connector)
+			{
+				return m;
+			}
+		}
+		return nullptr;
+	}
+
+	// Takes the monitor out, so nothing finds it any more; returns whether it was in
+	bool Unregister(IndirectMonitorContext* m)
+	{
+		auto it = std::find(monitors.begin(), monitors.end(), m);
+		if (it == monitors.end())
+		{
+			return false;
+		}
+		monitors.erase(it);
+		m->registered = false;
+		if (m->connector < slotUsed.size())
+		{
+			slotUsed[m->connector] = false;
+		}
+		return true;
+	}
 };
 
-// Default modes reported for edid-less monitors. The second mode is set as preferred
-static const struct VirtualMonitorMode s_DefaultModes[] = {
-	{800, 600, 30000},
-	{800, 600, 59940},
-	{800, 600, 60000},
-	{800, 600, 72000},
-	{800, 600, 90000},
-	{800, 600, 120000},
-	{800, 600, 144000},
-	{800, 600, 240000},
-	{1280, 720, 30000},
-	{1280, 720, 59940},
-	{1280, 720, 60000},
-	{1280, 720, 72000},
-	{1280, 720, 90000},
-	{1280, 720, 120000},
-	{1280, 720, 144000},
-	{1366, 768, 30000},
-	{1366, 768, 59940},
-	{1366, 768, 60000},
-	{1366, 768, 72000},
-	{1366, 768, 90000},
-	{1366, 768, 120000},
-	{1366, 768, 144000},
-	{1366, 768, 240000},
-	{1920, 1080, 30000},
-	{1920, 1080, 59940},
-	{1920, 1080, 60000},
-	{1920, 1080, 72000},
-	{1920, 1080, 90000},
-	{1920, 1080, 120000},
-	{1920, 1080, 144000},
-	{1920, 1080, 240000},
-	{2560, 1440, 30000},
-	{2560, 1440, 59940},
-	{2560, 1440, 60000},
-	{2560, 1440, 72000},
-	{2560, 1440, 90000},
-	{2560, 1440, 120000},
-	{2560, 1440, 144000},
-	{2560, 1440, 240000},
-	{3840, 2160, 30000},
-	{3840, 2160, 59940},
-	{3840, 2160, 60000},
-	{3840, 2160, 72000},
-	{3840, 2160, 90000},
-	{3840, 2160, 120000},
-	{3840, 2160, 144000},
-	{3840, 2160, 240000},
+static MonitorRegistry g_Registry;
 
-	// // Valve Index (1440x1600 per eye -> 2880x1600 combined)
-	// {2880, 1600, 60000},
-	// {2880, 1600, 72000},
-	// {2880, 1600, 90000},
-	// {2880, 1600, 120000},
-	// {2880, 1600, 144000},
-	// {2880, 1600, 240000},
+// Removes every monitor, for the watchdog and when the driver unloads
+static void DisconnectAllMonitors()
+{
+	std::vector<IDDCX_MONITOR> departing;
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		for (auto* m : std::vector<IndirectMonitorContext*>(g_Registry.monitors))
+		{
+			if (m->arrived)
+			{
+				departing.push_back(m->monitor);
+				g_Registry.Unregister(m);
+			}
+		}
+	}
 
-	// // Meta Quest 2 (1832x1920 per eye -> 3664x1920 combined)
-	// {3664, 1920, 60000},
-	// {3664, 1920, 72000},
-	// {3664, 1920, 90000},
-	// {3664, 1920, 120000},
-	// {3664, 1920, 144000},
-	// {3664, 1920, 240000},
+	for (auto monitor : departing)
+	{
+		IddCxMonitorDeparture(monitor);
+	}
 
-	// // Meta Quest 3 (2064x2208 per eye -> 4128x2208 combined)
-	// {4128, 2208, 60000},
-	// {4128, 2208, 72000},
-	// {4128, 2208, 90000},
-	// {4128, 2208, 120000},
-	// {4128, 2208, 144000},
-	// {4128, 2208, 240000},
+	if (!departing.empty())
+	{
+		TraceLoggingWrite(g_Provider, "AllDisplaysRemoved", TraceLoggingUInt32((UINT32)departing.size(), "Count"));
+	}
+}
 
-	// // Apple Vision Pro (3660x3142 per eye -> 7320x3142 combined)
-	// {7320, 3142, 60000},
-	// {7320, 3142, 72000},
-	// {7320, 3142, 90000},
-	// {7320, 3142, 120000},
-	// {7320, 3142, 144000},
-	// {7320, 3142, 240000},
-};
+#pragma endregion
+
+#pragma region Watchdog
+
+// Monitors are removed when no request has come for this many seconds, so a crashed caller doesn't
+// leave them behind
+static std::atomic<DWORD> g_WatchdogCountdown{0};
+static std::atomic<bool> g_WatchdogStop{false};
+static std::thread g_WatchdogThread;
+
+static void RunWatchdog()
+{
+	if (!g_WatchdogTimeout)
+	{
+		return;
+	}
+
+	g_WatchdogCountdown = g_WatchdogTimeout.load();
+	g_WatchdogThread = std::thread([] {
+		while (!g_WatchdogStop)
+		{
+			Sleep(1000);
+
+			bool empty;
+			{
+				std::lock_guard<std::mutex> lg(g_Registry.lock);
+				empty = g_Registry.monitors.empty();
+			}
+
+			DWORD countdown = g_WatchdogCountdown;
+			if (empty || countdown == 0)
+			{
+				continue;
+			}
+
+			if (g_WatchdogCountdown.compare_exchange_strong(countdown, countdown - 1) && countdown == 1)
+			{
+				TraceLoggingWrite(g_Provider, "WatchdogExpired");
+				DisconnectAllMonitors();
+			}
+		}
+
+		DisconnectAllMonitors();
+	});
+}
+
+static void ResetWatchdog()
+{
+	g_WatchdogCountdown = g_WatchdogTimeout.load();
+}
 
 #pragma endregion
 
 #pragma region helpers
 
-static inline void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync, bool bMonitorMode)
+static inline void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, const LUZVDA_MODE& M, bool bMonitorMode)
 {
-	Mode.totalSize.cx = Mode.activeSize.cx = Width;
-	Mode.totalSize.cy = Mode.activeSize.cy = Height;
+	Mode.totalSize.cx = Mode.activeSize.cx = M.width;
+	Mode.totalSize.cy = Mode.activeSize.cy = M.height;
 
 	// See https://docs.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_video_signal_info
 	Mode.AdditionalSignalInfo.vSyncFreqDivider = bMonitorMode ? 0 : 1;
 	Mode.AdditionalSignalInfo.videoStandard = 255;
 
-	DWORD Denominator = 1000;
-
-	if (isHDRSupported) {
-		if (VSync < 1000) {
-			VSync *= 1000;
-		}
-	} else {
-		if (VSync % 1000 > 500) {
-			VSync = (VSync / 1000) + 1;
-		} else {
-			VSync /= 1000;
-		}
-		Denominator = 1;
-	}
-
-	Mode.vSyncFreq.Numerator = VSync;
-	Mode.vSyncFreq.Denominator = Denominator;
-	Mode.hSyncFreq.Numerator = VSync * Height;
-	Mode.hSyncFreq.Denominator = Denominator;
+	// Rates are in millihertz, which keeps 59.94 Hz exact
+	Mode.vSyncFreq.Numerator = M.refresh_mhz;
+	Mode.vSyncFreq.Denominator = 1000;
+	Mode.hSyncFreq.Numerator = (UINT32)((UINT64)M.refresh_mhz * M.height);
+	Mode.hSyncFreq.Denominator = 1000;
 
 	Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
 
-	Mode.pixelRate = ((UINT64) VSync) * ((UINT64) Width) * ((UINT64) Height) / Denominator;
+	Mode.pixelRate = (UINT64)M.refresh_mhz * M.width * M.height / 1000;
 }
 
-static IDDCX_MONITOR_MODE CreateIddCxMonitorMode(DWORD Width, DWORD Height, DWORD VSync, IDDCX_MONITOR_MODE_ORIGIN Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER)
-{
-	IDDCX_MONITOR_MODE Mode = {};
-
-	Mode.Size = sizeof(Mode);
-	Mode.Origin = Origin;
-	FillSignalInfo(Mode.MonitorVideoSignalInfo, Width, Height, VSync, true);
-
-	return Mode;
-}
-
-static IDDCX_MONITOR_MODE2 CreateIddCxMonitorMode2(DWORD Width, DWORD Height, DWORD VSync, IDDCX_MONITOR_MODE_ORIGIN Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER)
+static IDDCX_MONITOR_MODE2 CreateIddCxMonitorMode2(const LUZVDA_MODE& M, IDDCX_MONITOR_MODE_ORIGIN Origin)
 {
 	IDDCX_MONITOR_MODE2 Mode = {};
 
 	Mode.Size = sizeof(Mode);
 	Mode.Origin = Origin;
-	Mode.BitsPerComponent.Rgb = SDRBITS | HDRBITS;
-	FillSignalInfo(Mode.MonitorVideoSignalInfo, Width, Height, VSync, true);
+	Mode.BitsPerComponent.Rgb = g_SdrBits | g_HdrBits;
+	FillSignalInfo(Mode.MonitorVideoSignalInfo, M, true);
 
 	return Mode;
 }
 
-static IDDCX_TARGET_MODE CreateIddCxTargetMode(DWORD Width, DWORD Height, DWORD VSync)
-{
-	IDDCX_TARGET_MODE Mode = {};
-
-	Mode.Size = sizeof(Mode);
-	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, Width, Height, VSync, false);
-
-	return Mode;
-}
-
-static IDDCX_TARGET_MODE2 CreateIddCxTargetMode2(DWORD Width, DWORD Height, DWORD VSync)
+static IDDCX_TARGET_MODE2 CreateIddCxTargetMode2(const LUZVDA_MODE& M)
 {
 	IDDCX_TARGET_MODE2 Mode = {};
 
 	Mode.Size = sizeof(Mode);
-	Mode.BitsPerComponent.Rgb = SDRBITS | HDRBITS;
-	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, Width, Height, VSync, false);
+	Mode.BitsPerComponent.Rgb = g_SdrBits | g_HdrBits;
+	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, M, false);
 
 	return Mode;
+}
+
+static LUZVDA_LUID ToProtocol(const LUID& luid)
+{
+	return {luid.LowPart, luid.HighPart};
 }
 
 #pragma endregion
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
-EVT_WDF_DRIVER_UNLOAD SudoVDADriverUnload;
-EVT_WDF_DRIVER_DEVICE_ADD SudoVDADeviceAdd;
-EVT_WDF_DEVICE_D0_ENTRY SudoVDADeviceD0Entry;
+EVT_WDF_DRIVER_UNLOAD LuzVDADriverUnload;
+EVT_WDF_DRIVER_DEVICE_ADD LuzVDADeviceAdd;
+EVT_WDF_DEVICE_D0_ENTRY LuzVDADeviceD0Entry;
 
-EVT_IDD_CX_ADAPTER_INIT_FINISHED SudoVDAAdapterInitFinished;
-EVT_IDD_CX_ADAPTER_COMMIT_MODES SudoVDAAdapterCommitModes;
+EVT_IDD_CX_DEVICE_IO_CONTROL LuzVDAIoDeviceControl;
+EVT_IDD_CX_ADAPTER_INIT_FINISHED LuzVDAAdapterInitFinished;
+EVT_IDD_CX_MONITOR_GET_DEFAULT_DESCRIPTION_MODES LuzVDAMonitorGetDefaultModes;
+EVT_IDD_CX_MONITOR_ASSIGN_SWAPCHAIN LuzVDAMonitorAssignSwapChain;
+EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN LuzVDAMonitorUnassignSwapChain;
 
-EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION SudoVDAParseMonitorDescription;
-EVT_IDD_CX_MONITOR_GET_DEFAULT_DESCRIPTION_MODES SudoVDAMonitorGetDefaultModes;
-EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES SudoVDAMonitorQueryModes;
-
-EVT_IDD_CX_MONITOR_ASSIGN_SWAPCHAIN SudoVDAMonitorAssignSwapChain;
-EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN SudoVDAMonitorUnassignSwapChain;
-
-EVT_IDD_CX_ADAPTER_QUERY_TARGET_INFO SudoVDAAdapterQueryTargetInfo;
-EVT_IDD_CX_MONITOR_SET_DEFAULT_HDR_METADATA SudoVDAMonitorSetDefaultHdrMetadata;
-EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2 SudoVDAParseMonitorDescription2;
-EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES2 SudoVDAMonitorQueryModes2;
-EVT_IDD_CX_ADAPTER_COMMIT_MODES2 SudoVDAAdapterCommitModes2;
-
-EVT_IDD_CX_MONITOR_SET_GAMMA_RAMP SudoVDAMonitorSetGammaRamp;
+EVT_IDD_CX_ADAPTER_QUERY_TARGET_INFO LuzVDAAdapterQueryTargetInfo;
+EVT_IDD_CX_MONITOR_SET_DEFAULT_HDR_METADATA LuzVDAMonitorSetDefaultHdrMetadata;
+EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2 LuzVDAParseMonitorDescription2;
+EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES2 LuzVDAMonitorQueryModes2;
+EVT_IDD_CX_ADAPTER_COMMIT_MODES2 LuzVDAAdapterCommitModes2;
+EVT_IDD_CX_MONITOR_SET_GAMMA_RAMP LuzVDAMonitorSetGammaRamp;
 
 struct IndirectDeviceContextWrapper
 {
@@ -289,121 +382,9 @@ extern "C" BOOL WINAPI DllMain(
 	return TRUE;
 }
 
-void LoadSettings() {
-	HKEY hKey;
-	DWORD bufferSize;
-	LONG lResult;
-
-	// Open the registry key
-	lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\SudoMaker\\SudoVDA", 0, KEY_READ, &hKey);
-	if (lResult != ERROR_SUCCESS) {
-		return;
-	}
-
-	// Query gpuName
-	wchar_t gpuName[128];
-	bufferSize = sizeof(gpuName);
-	lResult = RegQueryValueExW(hKey, L"gpuName", NULL, NULL, (LPBYTE)gpuName, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		AdapterOption adapterOpt = AdapterOption();
-		adapterOpt.selectGPU(gpuName);
-
-		preferredAdapterLuid = adapterOpt.adapterLuid;
-		preferredAdapterChanged = adapterOpt.hasTargetAdapter;
-	}
-
-	// Query Test mode
-	DWORD _testMode;
-	bufferSize = sizeof(DWORD);
-	lResult = RegQueryValueExW(hKey, L"testMode", NULL, NULL, (LPBYTE)&_testMode, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		testMode = !!_testMode;
-	}
-
-	// Query watchdog
-	DWORD _watchdogTimeout;
-	bufferSize = sizeof(DWORD);
-	lResult = RegQueryValueExW(hKey, L"watchdog", NULL, NULL, (LPBYTE)&_watchdogTimeout, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		watchdogTimeout = _watchdogTimeout;
-	}
-
-	// Query Max monitor count
-	DWORD _maxMonitorCount;
-	bufferSize = sizeof(DWORD);
-	lResult = RegQueryValueExW(hKey, L"maxMonitors", NULL, NULL, (LPBYTE)&_maxMonitorCount, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		MaxVirtualMonitorCount = _maxMonitorCount;
-	}
-
-	// Query SDRBits
-	DWORD _sdrBits;
-	bufferSize = sizeof(DWORD);
-	lResult = RegQueryValueExW(hKey, L"sdrBits", NULL, NULL, (LPBYTE)&_sdrBits, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		if (_sdrBits == 10) {
-			SDRBITS = IDDCX_BITS_PER_COMPONENT_10;
-		}
-	}
-
-	// Query HDRBits
-	DWORD _hdrBits;
-	bufferSize = sizeof(DWORD);
-	lResult = RegQueryValueExW(hKey, L"hdrBits", NULL, NULL, (LPBYTE)&_hdrBits, &bufferSize);
-	if (lResult == ERROR_SUCCESS) {
-		if (_hdrBits == 12) {
-			HDRBITS = IDDCX_BITS_PER_COMPONENT_12;
-		}
-	}
-
-	// Close the registry key
-	RegCloseKey(hKey);
-}
-
-void DisconnectAllMonitors() {
-	std::lock_guard<std::mutex> lg(monitorListOp);
-
-	if (monitorCtxList.empty()) {
-		return;
-	}
-
-	for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
-		auto* ctx = *it;
-		// Remove the monitor
-		freeConnectorSlots.push(ctx->connectorId);
-		IddCxMonitorDeparture(ctx->GetMonitor());
-	}
-
-	monitorCtxList.clear();
-}
-
-void RunWatchdog() {
-	if (watchdogTimeout) {
-		watchdogCountdown = watchdogTimeout;
-		watchdogThread = std::thread([]{
-			for (;;) {
-				if (watchdogTimeout) {
-					Sleep(1000);
-
-					if (!watchdogCountdown || monitorCtxList.empty()) {
-						continue;
-					}
-
-					watchdogCountdown -= 1;
-
-					if (!watchdogCountdown) {
-						DisconnectAllMonitors();
-					}
-				} else {
-					DisconnectAllMonitors();
-					return;
-				}
-			}
-		});
-	}
-}
-
-void SetHighPriority() {
+static void SetHighPriority()
+{
+	// Kept from SudoVDA: the whole WUDFHost process, so frames are consumed promptly under load
 	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 }
 
@@ -413,6 +394,8 @@ extern "C" NTSTATUS DriverEntry(
 	PUNICODE_STRING pRegistryPath
 )
 {
+	TraceLoggingRegister(g_Provider);
+
 	LoadSettings();
 
 	WDF_DRIVER_CONFIG Config;
@@ -422,14 +405,16 @@ extern "C" NTSTATUS DriverEntry(
 	WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
 
 	WDF_DRIVER_CONFIG_INIT(&Config,
-		SudoVDADeviceAdd
+		LuzVDADeviceAdd
 	);
 
-	Config.EvtDriverUnload = SudoVDADriverUnload;
+	Config.EvtDriverUnload = LuzVDADriverUnload;
 
 	Status = WdfDriverCreate(pDriverObject, pRegistryPath, &Attributes, &Config, WDF_NO_HANDLE);
 	if (!NT_SUCCESS(Status))
 	{
+		TraceLoggingWrite(g_Provider, "DriverCreateFailed", TraceLoggingHexInt32(Status, "Status"));
+		TraceLoggingUnregister(g_Provider);
 		return Status;
 	}
 
@@ -437,38 +422,49 @@ extern "C" NTSTATUS DriverEntry(
 
 	SetHighPriority();
 
+	TraceLoggingWrite(g_Provider, "DriverStarted",
+		TraceLoggingUInt32(g_WatchdogTimeout.load(), "Watchdog"),
+		TraceLoggingUInt32(g_MaxMonitors, "MaxMonitors"));
+
 	return Status;
 }
 
 _Use_decl_annotations_
-void SudoVDADriverUnload(_In_ WDFDRIVER) {
-	if (watchdogTimeout > 0) {
-		watchdogTimeout = 0;
-		watchdogThread.join();
-	} else {
+void LuzVDADriverUnload(_In_ WDFDRIVER)
+{
+	if (g_WatchdogThread.joinable())
+	{
+		// The thread removes the monitors on its way out
+		g_WatchdogStop = true;
+		g_WatchdogThread.join();
+	}
+	else
+	{
 		DisconnectAllMonitors();
 	}
+
+	TraceLoggingUnregister(g_Provider);
 }
 
-VOID SudoVDAIoDeviceControl(
-	_In_ WDFDEVICE Device,
-	_In_ WDFREQUEST Request,
-	_In_ size_t OutputBufferLength,
-	_In_ size_t InputBufferLength,
-	_In_ ULONG IoControlCode
-);
-
 _Use_decl_annotations_
-NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
+NTSTATUS LuzVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 {
 	NTSTATUS Status = STATUS_SUCCESS;
 	WDF_PNPPOWER_EVENT_CALLBACKS PnpPowerCallbacks;
 
 	UNREFERENCED_PARAMETER(Driver);
 
+	// The callbacks HDR and exact refresh rates need came with IddCx 1.10 (Windows 11 24H2). The INF
+	// only installs there, so this is a second line of defense.
+	if (!IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo))
+	{
+		TraceLoggingWrite(g_Provider, "IddCxTooOld");
+		return STATUS_NOT_SUPPORTED;
+	}
+
 	// Register for power callbacks - in this sample only power-on is needed
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&PnpPowerCallbacks);
-	PnpPowerCallbacks.EvtDeviceD0Entry = SudoVDADeviceD0Entry;
+	PnpPowerCallbacks.EvtDeviceD0Entry = LuzVDADeviceD0Entry;
 	WdfDeviceInitSetPnpPowerEventCallbacks(pDeviceInit, &PnpPowerCallbacks);
 
 	IDD_CX_CLIENT_CONFIG IddConfig;
@@ -476,28 +472,20 @@ NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 
 	// If the driver wishes to handle custom IoDeviceControl requests, it's necessary to use this callback since IddCx
 	// redirects IoDeviceControl requests to an internal queue.
-	IddConfig.EvtIddCxDeviceIoControl = SudoVDAIoDeviceControl;
+	IddConfig.EvtIddCxDeviceIoControl = LuzVDAIoDeviceControl;
 
-	IddConfig.EvtIddCxAdapterInitFinished = SudoVDAAdapterInitFinished;
+	IddConfig.EvtIddCxAdapterInitFinished = LuzVDAAdapterInitFinished;
 
-	IddConfig.EvtIddCxMonitorGetDefaultDescriptionModes = SudoVDAMonitorGetDefaultModes;
-	IddConfig.EvtIddCxMonitorAssignSwapChain = SudoVDAMonitorAssignSwapChain;
-	IddConfig.EvtIddCxMonitorUnassignSwapChain = SudoVDAMonitorUnassignSwapChain;
+	IddConfig.EvtIddCxMonitorGetDefaultDescriptionModes = LuzVDAMonitorGetDefaultModes;
+	IddConfig.EvtIddCxMonitorAssignSwapChain = LuzVDAMonitorAssignSwapChain;
+	IddConfig.EvtIddCxMonitorUnassignSwapChain = LuzVDAMonitorUnassignSwapChain;
 
-	if (IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo))
-	{
-		isHDRSupported = true;
-		IddConfig.EvtIddCxAdapterQueryTargetInfo = SudoVDAAdapterQueryTargetInfo;
-		IddConfig.EvtIddCxMonitorSetDefaultHdrMetaData = SudoVDAMonitorSetDefaultHdrMetadata;
-		IddConfig.EvtIddCxParseMonitorDescription2 = SudoVDAParseMonitorDescription2;
-		IddConfig.EvtIddCxMonitorQueryTargetModes2 = SudoVDAMonitorQueryModes2;
-		IddConfig.EvtIddCxAdapterCommitModes2 = SudoVDAAdapterCommitModes2;
-		IddConfig.EvtIddCxMonitorSetGammaRamp = SudoVDAMonitorSetGammaRamp;
-	} else {
-		IddConfig.EvtIddCxParseMonitorDescription = SudoVDAParseMonitorDescription;
-		IddConfig.EvtIddCxMonitorQueryTargetModes = SudoVDAMonitorQueryModes;
-		IddConfig.EvtIddCxAdapterCommitModes = SudoVDAAdapterCommitModes;
-	}
+	IddConfig.EvtIddCxAdapterQueryTargetInfo = LuzVDAAdapterQueryTargetInfo;
+	IddConfig.EvtIddCxMonitorSetDefaultHdrMetaData = LuzVDAMonitorSetDefaultHdrMetadata;
+	IddConfig.EvtIddCxParseMonitorDescription2 = LuzVDAParseMonitorDescription2;
+	IddConfig.EvtIddCxMonitorQueryTargetModes2 = LuzVDAMonitorQueryModes2;
+	IddConfig.EvtIddCxAdapterCommitModes2 = LuzVDAAdapterCommitModes2;
+	IddConfig.EvtIddCxMonitorSetGammaRamp = LuzVDAMonitorSetGammaRamp;
 
 	Status = IddCxDeviceInitConfig(pDeviceInit, &IddConfig);
 	if (!NT_SUCCESS(Status))
@@ -524,9 +512,10 @@ NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 		return Status;
 	}
 
+	static const GUID InterfaceGuid = LUZVDA_INTERFACE_GUID_INIT;
 	Status = WdfDeviceCreateDeviceInterface(
 		Device,
-		&SUVDA_INTERFACE_GUID,
+		&InterfaceGuid,
 		NULL
 	);
 
@@ -535,6 +524,11 @@ NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 	}
 
 	Status = IddCxDeviceInitialize(Device);
+	if (!NT_SUCCESS(Status))
+	{
+		TraceLoggingWrite(g_Provider, "DeviceInitializeFailed", TraceLoggingHexInt32(Status, "Status"));
+		return Status;
+	}
 
 	// Create a new device context object and attach it to the WDF device object
 	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
@@ -544,7 +538,7 @@ NTSTATUS SudoVDADeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDADeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+NTSTATUS LuzVDADeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
 	UNREFERENCED_PARAMETER(PreviousState);
 
@@ -560,11 +554,6 @@ NTSTATUS SudoVDADeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousS
 
 Direct3DDevice::Direct3DDevice(LUID AdapterLuid) : AdapterLuid(AdapterLuid)
 {
-}
-
-Direct3DDevice::Direct3DDevice()
-{
-	AdapterLuid = {};
 }
 
 HRESULT Direct3DDevice::Init()
@@ -585,7 +574,8 @@ HRESULT Direct3DDevice::Init()
 	}
 
 	// Create a D3D device using the render adapter. BGRA support is required by the WHQL test suite.
-	hr = D3D11CreateDevice(Adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &Device, nullptr, &DeviceContext);
+	const D3D_FEATURE_LEVEL FeatureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+	hr = D3D11CreateDevice(Adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, FeatureLevels, ARRAYSIZE(FeatureLevels), D3D11_SDK_VERSION, &Device, nullptr, &DeviceContext);
 	if (FAILED(hr))
 	{
 		// If creating the D3D device failed, it's possible the render GPU was lost (e.g. detachable GPU) or else the
@@ -600,7 +590,7 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
 	: m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
 {
 	m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
@@ -641,7 +631,10 @@ void SwapChainProcessor::Run()
 	WdfObjectDelete((WDFOBJECT)m_hSwapChain);
 	m_hSwapChain = nullptr;
 
-	AvRevertMmThreadCharacteristics(AvTaskHandle);
+	if (AvTaskHandle)
+	{
+		AvRevertMmThreadCharacteristics(AvTaskHandle);
+	}
 }
 
 void SwapChainProcessor::RunCore()
@@ -668,25 +661,10 @@ void SwapChainProcessor::RunCore()
 	{
 		ComPtr<IDXGIResource> AcquiredBuffer;
 
-		IDXGIResource* pSurface;
-
-		if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
-			IDARG_IN_RELEASEANDACQUIREBUFFER2 BufferInArgs = {};
-			BufferInArgs.Size = sizeof(BufferInArgs);
-			IDARG_OUT_RELEASEANDACQUIREBUFFER2 Buffer = {};
-			hr = IddCxSwapChainReleaseAndAcquireBuffer2(m_hSwapChain, &BufferInArgs, &Buffer);
-			pSurface = Buffer.MetaData.pSurface;
-		}
-		else
-		{
-			IDARG_OUT_RELEASEANDACQUIREBUFFER Buffer = {};
-			hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
-			pSurface = Buffer.MetaData.pSurface;
-		}
-
-		// Ask for the next buffer from the producer
-		// IDARG_OUT_RELEASEANDACQUIREBUFFER Buffer = {};
-		// hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
+		IDARG_IN_RELEASEANDACQUIREBUFFER2 BufferInArgs = {};
+		BufferInArgs.Size = sizeof(BufferInArgs);
+		IDARG_OUT_RELEASEANDACQUIREBUFFER2 Buffer = {};
+		hr = IddCxSwapChainReleaseAndAcquireBuffer2(m_hSwapChain, &BufferInArgs, &Buffer);
 
 		// AcquireBuffer immediately returns STATUS_PENDING if no buffer is yet available
 		if (hr == E_PENDING)
@@ -718,26 +696,14 @@ void SwapChainProcessor::RunCore()
 		else if (SUCCEEDED(hr))
 		{
 			// We have new frame to process, the surface has a reference on it that the driver has to release
-			AcquiredBuffer.Attach(pSurface);
+			AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
 
-			// ==============================
-			// TODO: Process the frame here
-			//
-			// This is the most performance-critical section of code in an IddCx driver. It's important that whatever
-			// is done with the acquired surface be finished as quickly as possible. This operation could be:
-			//  * a GPU copy to another buffer surface for later processing (such as a staging surface for mapping to CPU memory)
-			//  * a GPU encode operation
-			//  * a GPU VPBlt to another surface
-			//  * a GPU custom compute shader encode operation
-			// ==============================
+			// The frame isn't used: Apollo captures the display through Windows. Frames go straight to
+			// Apollo only in a later version.
 
 			// We have finished processing this frame hence we release the reference on it.
 			// If the driver forgets to release the reference to the surface, it will be leaked which results in the
 			// surfaces being left around after swapchain is destroyed.
-			// NOTE: Although in this sample we release reference to the surface here; the driver still
-			// owns the Buffer.MetaData.pSurface surface until IddCxSwapChainReleaseAndAcquireBuffer returns
-			// S_OK and gives us a new frame, a driver may want to use the surface in future to re-encode the desktop
-			// for better quality if there is no new frame for a while
 			AcquiredBuffer.Reset();
 
 			// Indicate to OS that we have finished inital processing of the frame, it is a hint that
@@ -747,13 +713,6 @@ void SwapChainProcessor::RunCore()
 			{
 				break;
 			}
-
-			// ==============================
-			// TODO: Report frame statistics once the asynchronous encode/send work is completed
-			//
-			// Drivers should report information about sub-frame timings, like encode time, send time, etc.
-			// ==============================
-			// IddCxSwapChainReportFrameStatistics(m_hSwapChain, ...);
 		}
 		else
 		{
@@ -770,10 +729,9 @@ void SwapChainProcessor::RunCore()
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
 	m_WdfDevice(WdfDevice)
 {
-	m_Adapter = {};
-	for (size_t i = 0; i < MaxVirtualMonitorCount; i++) {
-		freeConnectorSlots.push(i);
-	}
+	// One root device per driver: start with every connector free
+	std::lock_guard<std::mutex> lg(g_Registry.lock);
+	g_Registry.slotUsed.assign(g_MaxMonitors, false);
 }
 
 IndirectDeviceContext::~IndirectDeviceContext()
@@ -782,35 +740,28 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 void IndirectDeviceContext::InitAdapter()
 {
-	// ==============================
-	// TODO: Update the below diagnostic information in accordance with the target hardware. The strings and version
-	// numbers are used for telemetry and may be displayed to the user in some situations.
-	//
-	// This is also where static per-adapter capabilities are determined.
-	// ==============================
-
 	IDDCX_ADAPTER_CAPS AdapterCaps = {};
 	AdapterCaps.Size = sizeof(AdapterCaps);
 
-	if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
-		AdapterCaps.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
-	}
+	// Frames can arrive in FP16 for HDR
+	AdapterCaps.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
 
 	// Declare basic feature support for the adapter (required)
-	AdapterCaps.MaxMonitorsSupported = MaxVirtualMonitorCount;
+	AdapterCaps.MaxMonitorsSupported = g_MaxMonitors;
 	AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
 	AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
 	AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
 
 	// Declare your device strings for telemetry (required)
-	AdapterCaps.EndPointDiagnostics.pEndPointFriendlyName = L"SudoMaker Virtual Display Adapter";
-	AdapterCaps.EndPointDiagnostics.pEndPointManufacturerName = L"SudoMaker";
-	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"SudoVDA";
+	AdapterCaps.EndPointDiagnostics.pEndPointFriendlyName = L"LuzVDA Virtual Display Adapter";
+	AdapterCaps.EndPointDiagnostics.pEndPointManufacturerName = L"LuzVDA";
+	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"LuzVDA";
 
 	// Declare your hardware and firmware versions (required)
 	IDDCX_ENDPOINT_VERSION Version = {};
 	Version.Size = sizeof(Version);
-	Version.MajorVer = 1;
+	Version.MajorVer = LUZVDA_PROTOCOL_MAJOR;
+	Version.MinorVer = LUZVDA_PROTOCOL_MINOR;
 	AdapterCaps.EndPointDiagnostics.pFirmwareVersion = &Version;
 	AdapterCaps.EndPointDiagnostics.pHardwareVersion = &Version;
 
@@ -831,149 +782,310 @@ void IndirectDeviceContext::InitAdapter()
 	{
 		// Store a reference to the WDF adapter handle
 		m_Adapter = AdapterInitOut.AdapterObject;
+		g_Adapter = m_Adapter;
 
 		// Store the device context object into the WDF object context
 		auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(AdapterInitOut.AdapterObject);
 		pContext->pContext = this;
 	}
+	else
+	{
+		TraceLoggingWrite(g_Provider, "AdapterInitFailed", TraceLoggingHexInt32(Status, "Status"));
+	}
 }
 
-void IndirectDeviceContext::SetRenderAdapter(const LUID& AdapterLuid) {
+NTSTATUS IndirectDeviceContext::SetRenderAdapter(const LUID& AdapterLuid)
+{
+	if (!m_Adapter)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+
+	// Refuse a GPU that isn't there, which would have every swap-chain abandoned
+	ComPtr<IDXGIFactory4> Factory;
+	ComPtr<IDXGIAdapter1> Adapter;
+	if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&Factory))) || FAILED(Factory->EnumAdapterByLuid(AdapterLuid, IID_PPV_ARGS(&Adapter))))
+	{
+		return STATUS_NOT_FOUND;
+	}
+
+	{
+		std::lock_guard<std::mutex> lg(g_AdapterLock);
+		g_PreferredAdapter = AdapterLuid;
+		g_PreferredAdapterPending = true;
+		g_AbandonedSwapChains = 0;
+	}
+
 	IDARG_IN_ADAPTERSETRENDERADAPTER inArgs{AdapterLuid};
 	IddCxAdapterSetRenderAdapter(m_Adapter, &inArgs);
+
+	TraceLoggingWrite(g_Provider, "RenderAdapterSet",
+		TraceLoggingUInt32(AdapterLuid.LowPart, "LuidLow"),
+		TraceLoggingInt32(AdapterLuid.HighPart, "LuidHigh"));
+	return STATUS_SUCCESS;
 }
 
-NTSTATUS IndirectDeviceContext::CreateMonitor(IndirectMonitorContext*& pMonitorContext, uint8_t* edidData, const GUID& containerId, const VirtualMonitorMode& preferredMode) {
-	// ==============================
-	// TODO: In a real driver, the EDID should be retrieved dynamically from a connected physical monitor. The EDIDs
-	// provided here are purely for demonstration.
-	// Monitor manufacturers are required to correctly fill in physical monitor attributes in order to allow the OS
-	// to optimize settings like viewing distance and scale factor. Manufacturers should also use a unique serial
-	// number every single device to ensure the OS can tell the monitors apart.
-	// ==============================
+NTSTATUS IndirectDeviceContext::AddDisplay(const LUZVDA_DISPLAY_DESC& Desc, LUZVDA_ADD_OUT& Out)
+{
+	if (!m_Adapter)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
 
+	uint32_t serial = luzvda::edid::serial_for(Desc.monitor_guid.bytes);
+	IndirectMonitorContext* pContext = nullptr;
+
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+
+		// Adding a display that is already there returns it, so a caller can retry safely
+		if (auto* existing = g_Registry.FindByGuid(Desc.monitor_guid))
+		{
+			if (!existing->arrived)
+			{
+				return STATUS_DEVICE_BUSY;
+			}
+			if (std::memcmp(&existing->desc, &Desc, sizeof(Desc)) != 0)
+			{
+				return STATUS_OBJECT_NAME_COLLISION;
+			}
+			Out = {ToProtocol(existing->adapterLuid), existing->targetId, 0};
+			return STATUS_SUCCESS;
+		}
+
+		// Windows tells monitors apart by their EDID, whose serial comes from the GUID
+		if (g_Registry.FindBySerial(serial))
+		{
+			return STATUS_DUPLICATE_OBJECTID;
+		}
+
+		// The lowest free connector, so a display returns to the same one
+		UINT connector = 0;
+		while (connector < g_Registry.slotUsed.size() && g_Registry.slotUsed[connector])
+		{
+			connector++;
+		}
+		if (connector >= g_Registry.slotUsed.size())
+		{
+			return STATUS_TOO_MANY_NODES;
+		}
+
+		pContext = new IndirectMonitorContext(Desc, serial, connector);
+		g_Registry.slotUsed[connector] = true;
+		g_Registry.monitors.push_back(pContext);
+		pContext->registered = true;
+	}
+
+	// Without the lock from here: IddCx calls back into the driver while it creates the monitor
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+	Attr.EvtCleanupCallback = [](WDFOBJECT Object)
+	{
+		auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(Object);
+		if (pWrapper)
+		{
+			pWrapper->Cleanup();
+		}
+	};
 
-	// In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
 	IDDCX_MONITOR_INFO MonitorInfo = {};
 	MonitorInfo.Size = sizeof(MonitorInfo);
 	MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-	MonitorInfo.ConnectorIndex = (UINT)freeConnectorSlots.front();
+	MonitorInfo.ConnectorIndex = pContext->connector;
 
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-	MonitorInfo.MonitorDescription.DataSize = sizeof(edid_base);
-	MonitorInfo.MonitorDescription.pData = edidData;
-	MonitorInfo.MonitorContainerId = containerId;
+	MonitorInfo.MonitorDescription.DataSize = (UINT)pContext->edid.size();
+	MonitorInfo.MonitorDescription.pData = pContext->edid.data();
+	std::memcpy(&MonitorInfo.MonitorContainerId, Desc.monitor_guid.bytes, sizeof(GUID));
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
 	MonitorCreate.pMonitorInfo = &MonitorInfo;
 
-	// Create a monitor object with the specified monitor descriptor
 	IDARG_OUT_MONITORCREATE MonitorCreateOut;
 	NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
-	if (NT_SUCCESS(Status))
+	if (!NT_SUCCESS(Status))
 	{
-		freeConnectorSlots.pop();
-		// Create a new monitor context object and attach it to the Idd monitor object
-		auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
-		pMonitorContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject);
-		pMonitorContextWrapper->pContext = pMonitorContext;
-
-		pMonitorContext->monitorGuid = containerId;
-		pMonitorContext->connectorId = MonitorInfo.ConnectorIndex;
-		pMonitorContext->pEdidData = edidData;
-		pMonitorContext->preferredMode = preferredMode;
-		pMonitorContext->m_Adapter = m_Adapter;
-
-		// Tell the OS that the monitor has been plugged in
-		IDARG_OUT_MONITORARRIVAL ArrivalOut;
-		Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
-		if (NT_SUCCESS(Status)) {
-			pMonitorContext->adapterLuid = ArrivalOut.OsAdapterLuid;
-			pMonitorContext->targetId = ArrivalOut.OsTargetId;
+		{
+			std::lock_guard<std::mutex> lg(g_Registry.lock);
+			g_Registry.Unregister(pContext);
 		}
-	} else {
-		// Avoid memory leak
-		free(edidData);
+		delete pContext;
+		TraceLoggingWrite(g_Provider, "MonitorCreateFailed", TraceLoggingHexInt32(Status, "Status"));
+		return Status;
 	}
 
+	// From here the monitor object owns the context and deletes it
+	auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
+	pWrapper->pContext = pContext;
+
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		pContext->monitor = MonitorCreateOut.MonitorObject;
+	}
+
+	// Tell the OS that the monitor has been plugged in
+	IDARG_OUT_MONITORARRIVAL ArrivalOut;
+	Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+
+	std::lock_guard<std::mutex> lg(g_Registry.lock);
+	if (!NT_SUCCESS(Status))
+	{
+		// Don't leave a half-made monitor that a retry would mistake for a working one
+		g_Registry.Unregister(pContext);
+		TraceLoggingWrite(g_Provider, "MonitorArrivalFailed", TraceLoggingHexInt32(Status, "Status"));
+		return Status;
+	}
+
+	pContext->adapterLuid = ArrivalOut.OsAdapterLuid;
+	pContext->targetId = ArrivalOut.OsTargetId;
+	pContext->arrived = true;
+	Out = {ToProtocol(ArrivalOut.OsAdapterLuid), ArrivalOut.OsTargetId, 0};
+
+	const auto& preferred = Desc.modes[Desc.preferred_mode];
+	TraceLoggingWrite(g_Provider, "DisplayAdded",
+		TraceLoggingUInt32(pContext->connector, "Connector"),
+		TraceLoggingUInt32(ArrivalOut.OsTargetId, "TargetId"),
+		TraceLoggingUInt32(preferred.width, "Width"),
+		TraceLoggingUInt32(preferred.height, "Height"),
+		TraceLoggingUInt32(preferred.refresh_mhz, "RefreshMilliHz"),
+		TraceLoggingBool((Desc.flags & LUZVDA_DISPLAY_HDR) != 0, "Hdr"));
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS IndirectDeviceContext::RemoveDisplay(const LUZVDA_GUID& Guid)
+{
+	IDDCX_MONITOR monitor = nullptr;
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		auto* pContext = g_Registry.FindByGuid(Guid);
+		if (!pContext || !pContext->arrived)
+		{
+			return STATUS_NOT_FOUND;
+		}
+		monitor = pContext->monitor;
+		g_Registry.Unregister(pContext);
+	}
+
+	// Outside the lock: departure tears the monitor down, which may delete its context
+	NTSTATUS Status = IddCxMonitorDeparture(monitor);
+	TraceLoggingWrite(g_Provider, "DisplayRemoved", TraceLoggingHexInt32(Status, "Status"));
 	return Status;
 }
 
-IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor) :
-	m_Monitor(Monitor)
+NTSTATUS IndirectDeviceContext::UpdateModes(const LUZVDA_UPDATE_MODES& Update)
 {
-	// Store context for later use
-	monitorCtxList.emplace_back(this);
+	auto list = luzvda::mode_list(Update.mode_count, Update.preferred_mode, Update.modes);
+
+	IDDCX_MONITOR monitor = nullptr;
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		auto* pContext = g_Registry.FindByGuid(Update.monitor_guid);
+		if (!pContext || !pContext->arrived)
+		{
+			return STATUS_NOT_FOUND;
+		}
+		pContext->targetModes = list.modes;
+		monitor = pContext->monitor;
+	}
+
+	std::vector<IDDCX_TARGET_MODE2> TargetModes;
+	for (const auto& m : list.modes)
+	{
+		TargetModes.push_back(CreateIddCxTargetMode2(m));
+	}
+
+	IDARG_IN_UPDATEMODES2 inArgs = {};
+	inArgs.Reason = IDDCX_UPDATE_REASON_OTHER;
+	inArgs.TargetModeCount = (UINT)TargetModes.size();
+	inArgs.pTargetModes = TargetModes.data();
+
+	NTSTATUS Status = IddCxMonitorUpdateModes2(monitor, &inArgs);
+	TraceLoggingWrite(g_Provider, "ModesUpdated",
+		TraceLoggingUInt32((UINT32)TargetModes.size(), "Count"),
+		TraceLoggingHexInt32(Status, "Status"));
+	return Status;
+}
+
+IndirectMonitorContext::IndirectMonitorContext(const LUZVDA_DISPLAY_DESC& Desc, uint32_t Serial, UINT Connector) :
+	desc(Desc), serial(Serial), connector(Connector)
+{
+	luzvda::edid::input_t in;
+	in.serial = Serial;
+	in.name = luzvda::ascii_name(Desc.name, sizeof(Desc.name));
+	in.width_mm = Desc.width_mm;
+	in.height_mm = Desc.height_mm;
+	std::copy(std::begin(Desc.primaries), std::end(Desc.primaries), in.primaries.begin());
+	in.hdr = (Desc.flags & LUZVDA_DISPLAY_HDR) != 0;
+	in.max_nits = Desc.max_luminance;
+	in.max_full_frame_nits = Desc.max_full_frame_luminance;
+	in.min_luminance = Desc.min_luminance;
+	in.preferred = Desc.modes[Desc.preferred_mode];
+	in.split_name = g_EdidSplitName;
+	edid = luzvda::edid::build(in);
+
+	auto list = luzvda::mode_list(Desc.mode_count, Desc.preferred_mode, Desc.modes);
+	monitorModes = list.modes;
+	monitorPreferred = list.preferred;
+	targetModes = list.modes;
 }
 
 IndirectMonitorContext::~IndirectMonitorContext()
 {
 	m_ProcessingThread.reset();
-	if (pEdidData && pEdidData != edid_base) {
-		free(pEdidData);
+
+	// Torn down without a remove request, e.g. with the adapter
+	std::lock_guard<std::mutex> lg(g_Registry.lock);
+	if (registered)
+	{
+		g_Registry.Unregister(this);
 	}
 }
 
-IDDCX_MONITOR IndirectMonitorContext::GetMonitor() const {
-	return m_Monitor;
-}
-
-void IndirectMonitorContext::AssignSwapChain(const IDDCX_MONITOR& MonitorObject, const IDDCX_SWAPCHAIN& SwapChain, const LUID& RenderAdapter, const HANDLE& NewFrameEvent)
+void IndirectMonitorContext::AssignSwapChain(IDDCX_MONITOR MonitorObject, IDDCX_SWAPCHAIN SwapChain, const LUID& RenderAdapter, HANDLE NewFrameEvent)
 {
 	m_ProcessingThread.reset();
 
-	auto Device = make_shared<Direct3DDevice>(RenderAdapter);
+	auto Device = std::make_shared<Direct3DDevice>(RenderAdapter);
 	if (FAILED(Device->Init()))
 	{
 		// It's important to delete the swap-chain if D3D initialization fails, so that the OS knows to generate a new
 		// swap-chain and try again.
 		WdfObjectDelete(SwapChain);
+		return;
 	}
-	else
+
+	// Create a new swap-chain processing thread
+	m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+
+	// The cursor is drawn by the capture side, not composed into the frames. The event is required but
+	// never waited on; one per monitor, unnamed, closed with the monitor (SudoVDA leaked a named one
+	// on every assignment).
+	if (!m_CursorEvent.IsValid())
 	{
-		// Create a new swap-chain processing thread
-		m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+		m_CursorEvent.Attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+	}
+	if (!m_CursorEvent.IsValid())
+	{
+		return;
+	}
 
-		//create an event to get notified new cursor data
-		HANDLE mouseEvent = CreateEventA(
-			nullptr, //TODO set proper SECURITY_ATTRIBUTES
-			false,
-			false,
-			"arbitraryMouseEventName"
-		);
+	IDDCX_CURSOR_CAPS cursorInfo = {};
+	cursorInfo.Size = sizeof(cursorInfo);
+	cursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
+	cursorInfo.AlphaCursorSupport = true;
+	cursorInfo.MaxX = 64;
+	cursorInfo.MaxY = 64;
 
-		if (!mouseEvent)
-		{
-			//do error handling
-			return;
-		}
+	IDARG_IN_SETUP_HWCURSOR hwCursor = {};
+	hwCursor.CursorInfo = cursorInfo;
+	hwCursor.hNewCursorDataAvailable = m_CursorEvent.Get();
 
-		//set up cursor capabilities
-		IDDCX_CURSOR_CAPS cursorInfo = {};
-		cursorInfo.Size = sizeof(cursorInfo);
-		cursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL; //TODO play around with XOR cursors
-		cursorInfo.AlphaCursorSupport = true;
-		cursorInfo.MaxX = 64; //TODO figure out correct maximum value
-		cursorInfo.MaxY = 64; //TODO figure out correct maximum value
-
-		//prepare IddCxMonitorSetupHardwareCursor arguments
-		IDARG_IN_SETUP_HWCURSOR hwCursor = {};
-		hwCursor.CursorInfo = cursorInfo;
-		hwCursor.hNewCursorDataAvailable = mouseEvent; //this event will be called when new cursor data is available
-
-		NTSTATUS Status = IddCxMonitorSetupHardwareCursor(
-			MonitorObject, //handle to the monitor we want to enable hardware mouse on
-			&hwCursor
-		);
-
-		if (FAILED(Status))
-		{
-			//do error handling
-		}
+	NTSTATUS Status = IddCxMonitorSetupHardwareCursor(MonitorObject, &hwCursor);
+	if (!NT_SUCCESS(Status))
+	{
+		TraceLoggingWrite(g_Provider, "HardwareCursorFailed", TraceLoggingHexInt32(Status, "Status"));
 	}
 }
 
@@ -987,70 +1099,24 @@ void IndirectMonitorContext::UnassignSwapChain()
 
 #pragma region DDI Callbacks
 
-void IndirectDeviceContext::_TestCreateMonitor() {
-	auto connectorIndex = freeConnectorSlots.front();
-	std::string idx = std::to_string(connectorIndex);
-	std::string serialStr = "VDD2408";
-	serialStr += idx;
-	std::string dispName = "SudoVDD #";
-	dispName += idx;
-	GUID containerId;
-	CoCreateGuid(&containerId);
-	uint8_t* edidData = generate_edid(containerId.Data1, serialStr.c_str(), dispName.c_str());
-
-	VirtualMonitorMode mode{3000 + (DWORD)connectorIndex * 2, 2120 + (DWORD)connectorIndex, 120 + (DWORD)connectorIndex};
-
-	IndirectMonitorContext* pContext;
-	CreateMonitor(pContext, edidData, containerId, mode);
-}
-
 _Use_decl_annotations_
-NTSTATUS SudoVDAAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
+NTSTATUS LuzVDAAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
-	// UNREFERENCED_PARAMETER(AdapterObject);
-	// UNREFERENCED_PARAMETER(pInArgs);
-
-	if (NT_SUCCESS(pInArgs->AdapterInitStatus)) {
-		if (preferredAdapterChanged) {
-			IDARG_IN_ADAPTERSETRENDERADAPTER inArgs{preferredAdapterLuid};
-			IddCxAdapterSetRenderAdapter(AdapterObject, &inArgs);
-			preferredAdapterChanged = false;
-		}
-	}
-
-	if (testMode) {
-		auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(AdapterObject);
-		if (NT_SUCCESS(pInArgs->AdapterInitStatus))
+	if (NT_SUCCESS(pInArgs->AdapterInitStatus))
+	{
+		std::lock_guard<std::mutex> lg(g_AdapterLock);
+		if (g_PreferredAdapterPending)
 		{
-			for (size_t i = 0; i < 3; i++) {
-				pDeviceContextWrapper->pContext->_TestCreateMonitor();
-			}
+			IDARG_IN_ADAPTERSETRENDERADAPTER inArgs{g_PreferredAdapter};
+			IddCxAdapterSetRenderAdapter(AdapterObject, &inArgs);
 		}
 	}
 
-	// return STATUS_SUCCESS;
 	return pInArgs->AdapterInitStatus;
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAAdapterCommitModes(IDDCX_ADAPTER AdapterObject, const IDARG_IN_COMMITMODES* pInArgs)
-{
-	UNREFERENCED_PARAMETER(AdapterObject);
-	UNREFERENCED_PARAMETER(pInArgs);
-
-	// For the sample, do nothing when modes are picked - the swap-chain is taken care of by IddCx
-
-	// ==============================
-	// TODO: In a real driver, this function would be used to reconfigure the device to commit the new modes. Loop
-	// through pInArgs->pPaths and look for IDDCX_PATH_FLAGS_ACTIVE. Any path not active is inactive (e.g. the monitor
-	// should be turned off).
-	// ==============================
-
-	return STATUS_SUCCESS;
-}
-
-_Use_decl_annotations_
-NTSTATUS SudoVDAAdapterCommitModes2(
+NTSTATUS LuzVDAAdapterCommitModes2(
 	IDDCX_ADAPTER AdapterObject,
 	const IDARG_IN_COMMITMODES2* pInArgs
 )
@@ -1062,280 +1128,99 @@ NTSTATUS SudoVDAAdapterCommitModes2(
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInArgs, IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
-{
-	// ==============================
-	// TODO: In a real driver, this function would be called to generate monitor modes for an EDID by parsing it. In
-	// this sample driver, we hard-code the EDID, so this function can generate known modes.
-	// ==============================
-
-	if (pInArgs->MonitorDescription.DataSize != sizeof(edid_base))
-		return STATUS_INVALID_PARAMETER;
-
-	pOutArgs->MonitorModeBufferOutputCount = std::size(s_DefaultModes);
-
-	VirtualMonitorMode* pPreferredMode = nullptr;
-
-	for (auto &it: monitorCtxList) {
-		if (memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
-			if (it->preferredMode.Width) {
-				// We're adding 10 different modes, 1 original and 4 scaled x doubled refresh rate
-				pOutArgs->MonitorModeBufferOutputCount += std::size(mode_scale_factors) * 2;
-				pPreferredMode = &it->preferredMode;
-			}
-			break;
-		}
-	}
-
-	if (pInArgs->MonitorModeBufferInputCount < pOutArgs->MonitorModeBufferOutputCount)
-	{
-		// Return success if there was no buffer, since the caller was only asking for a count of modes
-		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
-	}
-	else
-	{
-		float vsyncMultiplier = 1;
-
-		if (pPreferredMode && pPreferredMode->VSync) {
-			float fVSync = (float)pPreferredMode->VSync / 1000;
-			vsyncMultiplier = fVSync / round(fVSync);
-			if (vsyncMultiplier > 1) {
-				vsyncMultiplier = 1;
-			}
-		}
-
-		for (DWORD ModeIndex = 0; ModeIndex < std::size(s_DefaultModes); ModeIndex++) {
-			auto vsyncTarget = s_DefaultModes[ModeIndex].VSync;
-			if (vsyncMultiplier != 1 && !(vsyncTarget % 1000)) {
-				vsyncTarget = (DWORD)(vsyncTarget * vsyncMultiplier);
-			}
-			pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
-				s_DefaultModes[ModeIndex].Width,
-				s_DefaultModes[ModeIndex].Height,
-				vsyncTarget,
-				IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-			);
-		}
-
-		if (pPreferredMode && pPreferredMode->Width) {
-			auto width = pPreferredMode->Width;
-			auto height = pPreferredMode->Height;
-			auto vsync = pPreferredMode->VSync;
-
-			for (uint8_t idx = 0; idx < std::size(mode_scale_factors); idx++) {
-				auto scalc_factor = mode_scale_factors[idx];
-				auto _width = width * scalc_factor / 100;
-				auto _height = height * scalc_factor / 100;
-
-				pInArgs->pMonitorModes[std::size(s_DefaultModes) + idx * 2] = CreateIddCxMonitorMode(
-					_width,
-					_height,
-					vsync,
-					IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-				);
-
-				pInArgs->pMonitorModes[std::size(s_DefaultModes) + idx * 2 + 1] = CreateIddCxMonitorMode(
-					_width,
-					_height,
-					vsync * 2,
-					IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-				);
-			}
-
-			pOutArgs->PreferredMonitorModeIdx = std::size(s_DefaultModes);
-		} else {
-			pOutArgs->PreferredMonitorModeIdx = 1;
-		}
-
-		return STATUS_SUCCESS;
-	}
-}
-
-_Use_decl_annotations_
-NTSTATUS SudoVDAParseMonitorDescription2(
+NTSTATUS LuzVDAParseMonitorDescription2(
 	const IDARG_IN_PARSEMONITORDESCRIPTION2* pInArgs,
 	IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs
 )
 {
-	if (pInArgs->MonitorDescription.DataSize != sizeof(edid_base))
+	// The EDIDs are the driver's own, so rather than parse one it finds the monitor by the serial it
+	// wrote and reports that monitor's modes
+	if (pInArgs->MonitorDescription.DataSize != 256 || !pInArgs->MonitorDescription.pData)
+	{
 		return STATUS_INVALID_PARAMETER;
-
-	pOutArgs->MonitorModeBufferOutputCount = std::size(s_DefaultModes);
-
-	VirtualMonitorMode* pPreferredMode = nullptr;
-
-	for (auto &it: monitorCtxList) {
-		if (memcmp(pInArgs->MonitorDescription.pData, it->pEdidData, sizeof(edid_base)) == 0) {
-			if (it->preferredMode.Width) {
-				// We're adding 10 different modes, 1 original and 4 scaled x doubled refresh rate
-				pOutArgs->MonitorModeBufferOutputCount += std::size(mode_scale_factors) * 2;
-				pPreferredMode = &it->preferredMode;
-			}
-			break;
-		}
 	}
 
-	if (pInArgs->MonitorModeBufferInputCount < pOutArgs->MonitorModeBufferOutputCount)
+	const auto* edid = static_cast<const uint8_t*>(pInArgs->MonitorDescription.pData);
+	uint32_t serial = edid[12] | (edid[13] << 8) | (edid[14] << 16) | ((uint32_t)edid[15] << 24);
+
+	std::lock_guard<std::mutex> lg(g_Registry.lock);
+	auto* pContext = g_Registry.FindBySerial(serial);
+	if (!pContext)
+	{
+		return STATUS_NOT_FOUND;
+	}
+
+	const auto& modes = pContext->monitorModes;
+	pOutArgs->MonitorModeBufferOutputCount = (UINT)modes.size();
+
+	if (pInArgs->MonitorModeBufferInputCount < modes.size())
 	{
 		// Return success if there was no buffer, since the caller was only asking for a count of modes
 		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
 	}
-	else
+
+	for (size_t i = 0; i < modes.size(); i++)
 	{
-		float vsyncMultiplier = 1;
+		pInArgs->pMonitorModes[i] = CreateIddCxMonitorMode2(modes[i], IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+	}
+	pOutArgs->PreferredMonitorModeIdx = (UINT)pContext->monitorPreferred;
 
-		if (pPreferredMode && pPreferredMode->VSync) {
-			float fVSync = (float)pPreferredMode->VSync / 1000;
-			vsyncMultiplier = fVSync / round(fVSync);
-			if (vsyncMultiplier > 1) {
-				vsyncMultiplier = 1;
-			}
-		}
+	return STATUS_SUCCESS;
+}
 
-		for (DWORD ModeIndex = 0; ModeIndex < std::size(s_DefaultModes); ModeIndex++) {
-			auto vsyncTarget = s_DefaultModes[ModeIndex].VSync;
-			if (vsyncMultiplier != 1 && !(vsyncTarget % 1000)) {
-				vsyncTarget = (DWORD)(vsyncTarget * vsyncMultiplier);
-			}
-			pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode2(
-				s_DefaultModes[ModeIndex].Width,
-				s_DefaultModes[ModeIndex].Height,
-				vsyncTarget,
-				IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-			);
-		}
+_Use_decl_annotations_
+NTSTATUS LuzVDAMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
+{
+	// Only for monitors without an EDID, which this driver never creates
+	UNREFERENCED_PARAMETER(MonitorObject);
 
-		if (pPreferredMode && pPreferredMode->Width) {
-			auto width = pPreferredMode->Width;
-			auto height = pPreferredMode->Height;
-			auto vsync = pPreferredMode->VSync;
+	static const LUZVDA_MODE Fallback = {1920, 1080, 60000};
 
-			for (uint8_t idx = 0; idx < std::size(mode_scale_factors); idx++) {
-				auto scalc_factor = mode_scale_factors[idx];
-				auto _width = width * scalc_factor / 100;
-				auto _height = height * scalc_factor / 100;
+	pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
+	pOutArgs->PreferredMonitorModeIdx = 0;
 
-				pInArgs->pMonitorModes[std::size(s_DefaultModes) + idx * 2] = CreateIddCxMonitorMode2(
-					_width,
-					_height,
-					vsync,
-					IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-				);
-
-				pInArgs->pMonitorModes[std::size(s_DefaultModes) + idx * 2 + 1] = CreateIddCxMonitorMode2(
-					_width,
-					_height,
-					vsync,
-					IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-				);
-			}
-
-			pOutArgs->PreferredMonitorModeIdx = std::size(s_DefaultModes);
-		} else {
-			pOutArgs->PreferredMonitorModeIdx = 1;
-		}
-
+	if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
+	{
 		return STATUS_SUCCESS;
 	}
-}
 
-_Use_decl_annotations_
-NTSTATUS SudoVDAMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
-{
-	// ==============================
-	// TODO: In a real driver, this function would be called to generate monitor modes for a monitor with no EDID.
-	// Drivers should report modes that are guaranteed to be supported by the transport protocol and by nearly all
-	// monitors (such 640x480, 800x600, or 1024x768). If the driver has access to monitor modes from a descriptor other
-	// than an EDID, those modes would also be reported here.
-	// ==============================
-
-	UNREFERENCED_PARAMETER(MonitorObject);
-
-	pOutArgs->DefaultMonitorModeBufferOutputCount = std::size(s_DefaultModes);
-	pOutArgs->PreferredMonitorModeIdx = 1;
-
-	if (pInArgs->DefaultMonitorModeBufferInputCount == 0) {
-		return STATUS_SUCCESS;
-	} else if (pInArgs->DefaultMonitorModeBufferInputCount < pOutArgs->DefaultMonitorModeBufferOutputCount) {
-		return STATUS_BUFFER_TOO_SMALL;
-	}
-
-	for (DWORD ModeIndex = 0; ModeIndex < std::size(s_DefaultModes); ModeIndex++) {
-		pInArgs->pDefaultMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
-			s_DefaultModes[ModeIndex].Width,
-			s_DefaultModes[ModeIndex].Height,
-			s_DefaultModes[ModeIndex].VSync,
-			IDDCX_MONITOR_MODE_ORIGIN_DRIVER
-		);
-	}
+	IDDCX_MONITOR_MODE Mode = {};
+	Mode.Size = sizeof(Mode);
+	Mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+	FillSignalInfo(Mode.MonitorVideoSignalInfo, Fallback, true);
+	pInArgs->pDefaultMonitorModes[0] = Mode;
 
 	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
+NTSTATUS LuzVDAMonitorQueryModes2(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES2* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-	UNREFERENCED_PARAMETER(MonitorObject);
-
-	pOutArgs->TargetModeBufferOutputCount = (UINT) std::size(s_DefaultModes);
-	auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-	if (pMonitorContextWrapper->pContext->preferredMode.Width) {
-		pOutArgs->TargetModeBufferOutputCount += std::size(mode_scale_factors) * 2;
+	auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
+	if (!pWrapper || !pWrapper->pContext)
+	{
+		return STATUS_INVALID_PARAMETER;
 	}
 
-	if (pInArgs->TargetModeBufferInputCount >= pOutArgs->TargetModeBufferOutputCount) {
-		vector<IDDCX_TARGET_MODE> TargetModes;
+	std::vector<LUZVDA_MODE> modes;
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		modes = pWrapper->pContext->targetModes;
+	}
 
-		auto width = pMonitorContextWrapper->pContext->preferredMode.Width;
-		auto height = pMonitorContextWrapper->pContext->preferredMode.Height;
-		auto vsync = pMonitorContextWrapper->pContext->preferredMode.VSync;
+	// Create a set of modes supported for frame processing and scan-out. The OS will report the available set of
+	// modes for a given output as the intersection of monitor modes with target modes.
+	pOutArgs->TargetModeBufferOutputCount = (UINT)modes.size();
 
-		float vsyncMultiplier = 1;
-
+	if (pInArgs->TargetModeBufferInputCount >= modes.size())
+	{
+		for (size_t i = 0; i < modes.size(); i++)
 		{
-			float fVSync = (float)vsync / 1000;
-			vsyncMultiplier = fVSync / round(fVSync);
-			if (vsyncMultiplier > 1) {
-				vsyncMultiplier = 1;
-			}
+			pInArgs->pTargetModes[i] = CreateIddCxTargetMode2(modes[i]);
 		}
-
-		// Create a set of modes supported for frame processing and scan-out. These are typically not based on the
-		// monitor's descriptor and instead are based on the static processing capability of the device. The OS will
-		// report the available set of modes for a given output as the intersection of monitor modes with target modes.
-
-		for (size_t i = 0; i < std::size(s_DefaultModes); i++) {
-			auto vsyncTarget = s_DefaultModes[i].VSync;
-			if (vsyncMultiplier != 1 && !(vsyncTarget % 1000)) {
-				vsyncTarget = (DWORD)(vsyncTarget * vsyncMultiplier);
-			}
-			TargetModes.push_back(CreateIddCxTargetMode(
-				s_DefaultModes[i].Width,
-				s_DefaultModes[i].Height,
-				vsyncTarget
-			));
-		}
-
-		for (uint8_t idx = 0; idx < std::size(mode_scale_factors); idx++) {
-			auto scalc_factor = mode_scale_factors[idx];
-			auto _width = width * scalc_factor / 100;
-			auto _height = height * scalc_factor / 100;
-
-			TargetModes.push_back(CreateIddCxTargetMode(
-				_width,
-				_height,
-				vsync
-			));
-
-			TargetModes.push_back(CreateIddCxTargetMode(
-				_width,
-				_height,
-				vsync * 2
-			));
-		}
-
-		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
-	} else if (pInArgs->TargetModeBufferInputCount != 0) {
+	}
+	else if (pInArgs->TargetModeBufferInputCount != 0)
+	{
 		return STATUS_BUFFER_TOO_SMALL;
 	}
 
@@ -1343,116 +1228,82 @@ NTSTATUS SudoVDAMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QU
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorQueryModes2(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES2* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
+NTSTATUS LuzVDAMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_SETSWAPCHAIN* pInArgs)
 {
-	UNREFERENCED_PARAMETER(MonitorObject);
-
-	pOutArgs->TargetModeBufferOutputCount = (UINT) std::size(s_DefaultModes);
-
-	auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-
-	if (pMonitorContextWrapper->pContext->preferredMode.Width) {
-		pOutArgs->TargetModeBufferOutputCount += std::size(mode_scale_factors) * 2;
+	auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
+	if (!pWrapper || !pWrapper->pContext)
+	{
+		return STATUS_INVALID_PARAMETER;
 	}
 
-	if (pInArgs->TargetModeBufferInputCount >= pOutArgs->TargetModeBufferOutputCount) {
-		vector<IDDCX_TARGET_MODE2> TargetModes;
-
-		auto width = pMonitorContextWrapper->pContext->preferredMode.Width;
-		auto height = pMonitorContextWrapper->pContext->preferredMode.Height;
-		auto vsync = pMonitorContextWrapper->pContext->preferredMode.VSync;
-
-		float vsyncMultiplier = 1;
-
+	{
+		std::lock_guard<std::mutex> lg(g_AdapterLock);
+		if (g_PreferredAdapterPending && !SameLuid(pInArgs->RenderAdapterLuid, g_PreferredAdapter))
 		{
-			float fVSync = (float)vsync / 1000;
-			vsyncMultiplier = fVSync / round(fVSync);
-			if (vsyncMultiplier > 1) {
-				vsyncMultiplier = 1;
+			// Ask for the preferred GPU again, a few times; after that take what the OS gives, so a GPU
+			// that won't take the display can't have every swap-chain abandoned forever
+			IDDCX_ADAPTER adapter = g_Adapter;
+			if (adapter && g_AbandonedSwapChains < 3)
+			{
+				g_AbandonedSwapChains++;
+				IDARG_IN_ADAPTERSETRENDERADAPTER inArgs{g_PreferredAdapter};
+				IddCxAdapterSetRenderAdapter(adapter, &inArgs);
+				return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
 			}
+			TraceLoggingWrite(g_Provider, "RenderAdapterNotTaken",
+				TraceLoggingUInt32(pInArgs->RenderAdapterLuid.LowPart, "LuidLow"),
+				TraceLoggingInt32(pInArgs->RenderAdapterLuid.HighPart, "LuidHigh"));
 		}
-
-		for (size_t i = 0; i < std::size(s_DefaultModes); i++) {
-			auto vsyncTarget = s_DefaultModes[i].VSync;
-			if (vsyncMultiplier != 1 && !(vsyncTarget % 1000)) {
-				vsyncTarget = (DWORD)(vsyncTarget * vsyncMultiplier);
-			}
-			TargetModes.push_back(CreateIddCxTargetMode2(
-				s_DefaultModes[i].Width,
-				s_DefaultModes[i].Height,
-				vsyncTarget
-			));
-		}
-
-		for (uint8_t idx = 0; idx < std::size(mode_scale_factors); idx++) {
-			auto scalc_factor = mode_scale_factors[idx];
-			auto _width = width * scalc_factor / 100;
-			auto _height = height * scalc_factor / 100;
-
-			TargetModes.push_back(CreateIddCxTargetMode2(
-				_width,
-				_height,
-				vsync
-			));
-
-			TargetModes.push_back(CreateIddCxTargetMode2(
-				_width,
-				_height,
-				vsync * 2
-			));
-		}
-
-		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
-	} else if (pInArgs->TargetModeBufferInputCount != 0) {
-		return STATUS_BUFFER_TOO_SMALL;
+		g_PreferredAdapterPending = false;
+		g_AbandonedSwapChains = 0;
 	}
 
+	pWrapper->pContext->AssignSwapChain(MonitorObject, pInArgs->hSwapChain, pInArgs->RenderAdapterLuid, pInArgs->hNextSurfaceAvailable);
 	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_SETSWAPCHAIN* pInArgs)
+NTSTATUS LuzVDAMonitorUnassignSwapChain(IDDCX_MONITOR MonitorObject)
 {
-	auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-
-	if (preferredAdapterChanged) {
-		if (memcmp(&pInArgs->RenderAdapterLuid, &preferredAdapterLuid, sizeof(LUID))) {
-			IDARG_IN_ADAPTERSETRENDERADAPTER inArgs{preferredAdapterLuid};
-			IddCxAdapterSetRenderAdapter(pMonitorContextWrapper->pContext->m_Adapter, &inArgs);
-			return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-		}
-		preferredAdapterChanged = false;
+	auto* pWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
+	if (pWrapper && pWrapper->pContext)
+	{
+		pWrapper->pContext->UnassignSwapChain();
 	}
-
-	pMonitorContextWrapper->pContext->AssignSwapChain(MonitorObject, pInArgs->hSwapChain, pInArgs->RenderAdapterLuid, pInArgs->hNextSurfaceAvailable);
 	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorUnassignSwapChain(IDDCX_MONITOR MonitorObject)
-{
-	auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-	pMonitorContextWrapper->pContext->UnassignSwapChain();
-	return STATUS_SUCCESS;
-}
-
-_Use_decl_annotations_
-NTSTATUS SudoVDAAdapterQueryTargetInfo(
+NTSTATUS LuzVDAAdapterQueryTargetInfo(
 	IDDCX_ADAPTER AdapterObject,
 	IDARG_IN_QUERYTARGET_INFO* pInArgs,
 	IDARG_OUT_QUERYTARGET_INFO* pOutArgs
 )
 {
 	UNREFERENCED_PARAMETER(AdapterObject);
-	UNREFERENCED_PARAMETER(pInArgs);
-	pOutArgs->TargetCaps = IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE | IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE;
-	pOutArgs->DitheringSupport.Rgb = HDRBITS;
+
+	// HDR only for monitors whose screen can show it; wide color for all
+	bool hdr = true;
+	{
+		std::lock_guard<std::mutex> lg(g_Registry.lock);
+		if (auto* pContext = g_Registry.FindByConnector(pInArgs->ConnectorIndex))
+		{
+			hdr = (pContext->desc.flags & LUZVDA_DISPLAY_HDR) != 0;
+		}
+	}
+
+	pOutArgs->TargetCaps = IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE;
+	if (hdr)
+	{
+		pOutArgs->TargetCaps |= IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
+	}
+	pOutArgs->DitheringSupport.Rgb = g_HdrBits;
 
 	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorSetDefaultHdrMetadata(
+NTSTATUS LuzVDAMonitorSetDefaultHdrMetadata(
 	IDDCX_MONITOR MonitorObject,
 	const IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA* pInArgs
 )
@@ -1464,7 +1315,7 @@ NTSTATUS SudoVDAMonitorSetDefaultHdrMetadata(
 }
 
 _Use_decl_annotations_
-NTSTATUS SudoVDAMonitorSetGammaRamp(
+NTSTATUS LuzVDAMonitorSetGammaRamp(
 	IDDCX_MONITOR MonitorObject,
 	const IDARG_IN_SET_GAMMARAMP* pInArgs
 )
@@ -1477,165 +1328,200 @@ NTSTATUS SudoVDAMonitorSetGammaRamp(
 
 #pragma endregion
 
-VOID SudoVDAIoDeviceControl(
-	_In_ WDFDEVICE Device,
-	_In_ WDFREQUEST Request,
-	_In_ size_t OutputBufferLength,
-	_In_ size_t InputBufferLength,
-	_In_ ULONG IoControlCode
+#pragma region Requests
+
+// The request's input, copied out before anything is written: METHOD_BUFFERED gives input and output
+// the same buffer
+template <typename T>
+static NTSTATUS ReadInput(WDFREQUEST Request, size_t InputBufferLength, T& Value)
+{
+	if (InputBufferLength < sizeof(T))
+	{
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	void* buffer = nullptr;
+	NTSTATUS Status = WdfRequestRetrieveInputBuffer(Request, sizeof(T), &buffer, nullptr);
+	if (!NT_SUCCESS(Status))
+	{
+		return Status;
+	}
+
+	std::memcpy(&Value, buffer, sizeof(T));
+	return STATUS_SUCCESS;
+}
+
+template <typename T>
+static NTSTATUS WriteOutput(WDFREQUEST Request, const T& Value, size_t& BytesReturned)
+{
+	void* buffer = nullptr;
+	NTSTATUS Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(T), &buffer, nullptr);
+	if (!NT_SUCCESS(Status))
+	{
+		return Status;
+	}
+
+	std::memcpy(buffer, &Value, sizeof(T));
+	BytesReturned = sizeof(T);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS StatusFor(luzvda::check_e Check)
+{
+	switch (Check)
+	{
+	case luzvda::check_e::ok:
+		return STATUS_SUCCESS;
+	case luzvda::check_e::too_small:
+		return STATUS_BUFFER_TOO_SMALL;
+	case luzvda::check_e::bad_struct_size:
+		return STATUS_REVISION_MISMATCH;
+	default:
+		return STATUS_INVALID_PARAMETER;
+	}
+}
+
+static void LogRejected(ULONG IoControlCode, luzvda::check_e Check)
+{
+	TraceLoggingWrite(g_Provider, "RequestRejected",
+		TraceLoggingHexUInt32(IoControlCode, "Code"),
+		TraceLoggingString(luzvda::describe(Check), "Reason"));
+}
+
+_Use_decl_annotations_
+VOID LuzVDAIoDeviceControl(
+	WDFDEVICE Device,
+	WDFREQUEST Request,
+	size_t OutputBufferLength,
+	size_t InputBufferLength,
+	ULONG IoControlCode
 )
 {
-	// Reset watchdog
-	if (IoControlCode != IOCTL_GET_WATCHDOG) {
-		watchdogCountdown = watchdogTimeout;
-	}
+	UNREFERENCED_PARAMETER(OutputBufferLength);
 
 	NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
 	size_t bytesReturned = 0;
 
-	switch (IoControlCode) {
-	case IOCTL_ADD_VIRTUAL_DISPLAY: {
-		if (freeConnectorSlots.empty()) {
-			Status = STATUS_TOO_MANY_NODES;
-			break;
-		}
+	auto* pDeviceWrapper = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+	auto* pDevice = pDeviceWrapper ? pDeviceWrapper->pContext : nullptr;
 
-		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_PARAMS) || OutputBufferLength < sizeof(VIRTUAL_DISPLAY_ADD_OUT)) {
-			Status = STATUS_BUFFER_TOO_SMALL;
-			break;
-		}
-
-		PVIRTUAL_DISPLAY_ADD_PARAMS params;
-		PVIRTUAL_DISPLAY_ADD_OUT output;
-		Status = WdfRequestRetrieveInputBuffer(Request, sizeof(VIRTUAL_DISPLAY_ADD_PARAMS), (PVOID*)&params, NULL);
-		if (!NT_SUCCESS(Status)) {
-			break;
-		}
-
-		Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(VIRTUAL_DISPLAY_ADD_OUT), (PVOID*)&output, NULL);
-		if (!NT_SUCCESS(Status)) {
-			break;
-		}
-
-		bool guidFound = false;
-
-		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
-			auto* ctx = *it;
-			if (ctx->monitorGuid == params->MonitorGuid) {
-				guidFound = true;
-				output->AdapterLuid = ctx->adapterLuid;
-				output->TargetId = ctx->targetId;
-				bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
-				break;
-			}
-		}
-
-		if (guidFound) {
-			Status = STATUS_SUCCESS;
-			break;
-		}
-
-		// Validate and add the virtual display
-		if (params->Width > 0 && params->Height > 0 && params->RefreshRate > 0) {
-			std::lock_guard<std::mutex> lg(monitorListOp);
-
-			auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(Device);
-
-			IndirectMonitorContext* pMonitorContext;
-			uint8_t* edidData = generate_edid(params->MonitorGuid.Data1, params->SerialNumber, params->DeviceName);
-			VirtualMonitorMode preferredMode = {params->Width, params->Height, params->RefreshRate};
-			if (preferredMode.VSync < 1000) {
-				preferredMode.VSync *= 1000;
-			}
-			Status = pDeviceContextWrapper->pContext->CreateMonitor(pMonitorContext, edidData, params->MonitorGuid, preferredMode);
-
-			if (!NT_SUCCESS(Status)) {
-				break;
-			}
-
-			output->AdapterLuid = pMonitorContext->adapterLuid;
-			output->TargetId = pMonitorContext->targetId;
-			bytesReturned = sizeof(VIRTUAL_DISPLAY_ADD_OUT);
-		}
-		else {
-			Status = STATUS_INVALID_PARAMETER;
-		}
-
+	switch (IoControlCode)
+	{
+	case IOCTL_LUZVDA_GET_VERSION: {
+		LUZVDA_VERSION version = {
+			LUZVDA_PROTOCOL_MAJOR,
+			LUZVDA_PROTOCOL_MINOR,
+			{LUZVDA_VERSION_MAJOR, LUZVDA_VERSION_MINOR, LUZVDA_VERSION_PATCH, LUZVDA_VERSION_BUILD},
+		};
+		Status = WriteOutput(Request, version, bytesReturned);
 		break;
 	}
-	case IOCTL_REMOVE_VIRTUAL_DISPLAY: {
-		if (InputBufferLength < sizeof(VIRTUAL_DISPLAY_REMOVE_PARAMS)) {
-			Status = STATUS_BUFFER_TOO_SMALL;
-			break;
-		}
-
-		PVIRTUAL_DISPLAY_REMOVE_PARAMS params;
-		Status = WdfRequestRetrieveInputBuffer(Request, sizeof(VIRTUAL_DISPLAY_REMOVE_PARAMS), (PVOID*)&params, NULL);
-		if (!NT_SUCCESS(Status)) {
-			break;
-		}
-
-		Status = STATUS_NOT_FOUND;
-
-		std::lock_guard<std::mutex> lg(monitorListOp);
-
-		for (auto it = monitorCtxList.begin(); it != monitorCtxList.end(); ++it) {
-			auto* ctx = *it;
-			if (ctx->monitorGuid == params->MonitorGuid) {
-				// Remove the monitor
-				freeConnectorSlots.push(ctx->connectorId);
-				IddCxMonitorDeparture(ctx->GetMonitor());
-				monitorCtxList.erase(it);
-				Status = STATUS_SUCCESS;
-				break;
-			}
-		}
-
-		break;
-	}
-	case IOCTL_SET_RENDER_ADAPTER: {
-		PVIRTUAL_DISPLAY_SET_RENDER_ADAPTER_PARAMS params;
-		Status = WdfRequestRetrieveInputBuffer(Request, sizeof(VIRTUAL_DISPLAY_SET_RENDER_ADAPTER_PARAMS), (PVOID*)&params, NULL);
-		if (!NT_SUCCESS(Status)) {
-			break;
-		}
-
-		auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(Device);
-
-		preferredAdapterLuid = params->AdapterLuid;
-		pDeviceContextWrapper->pContext->SetRenderAdapter(params->AdapterLuid);
-		preferredAdapterChanged = true;
-
-		break;
-	}
-	case IOCTL_GET_WATCHDOG: {
-		Status = STATUS_SUCCESS;
-		PVIRTUAL_DISPLAY_GET_WATCHDOG_OUT output;
-
-		Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(VIRTUAL_DISPLAY_GET_WATCHDOG_OUT), (PVOID*)&output, NULL);
-		if (!NT_SUCCESS(Status)) {
-			break;
-		}
-
-		output->Timeout = watchdogTimeout;
-		output->Countdown = watchdogCountdown;
-		bytesReturned = sizeof(VIRTUAL_DISPLAY_GET_WATCHDOG_OUT);
-	}
-	case IOCTL_DRIVER_PING: {
+	case IOCTL_LUZVDA_PING: {
+		ResetWatchdog();
 		Status = STATUS_SUCCESS;
 		break;
 	}
-	case IOCTL_GET_PROTOCOL_VERSION: {
-		Status = STATUS_SUCCESS;
-		PVIRTUAL_DISPLAY_GET_PROTOCOL_VERSION_OUT output;
+	case IOCTL_LUZVDA_GET_WATCHDOG: {
+		LUZVDA_WATCHDOG watchdog = {g_WatchdogTimeout.load(), g_WatchdogCountdown.load()};
+		Status = WriteOutput(Request, watchdog, bytesReturned);
+		break;
+	}
+	case IOCTL_LUZVDA_ADD_DISPLAY: {
+		ResetWatchdog();
 
-		Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(VIRTUAL_DISPLAY_GET_PROTOCOL_VERSION_OUT), (PVOID*)&output, NULL);
-		if (!NT_SUCCESS(Status)) {
+		LUZVDA_DISPLAY_DESC desc;
+		Status = ReadInput(Request, InputBufferLength, desc);
+		if (!NT_SUCCESS(Status))
+		{
 			break;
 		}
 
-		output->Version = VDAProtocolVersion;
-		bytesReturned = sizeof(VIRTUAL_DISPLAY_GET_PROTOCOL_VERSION_OUT);
+		auto check = luzvda::check(desc, InputBufferLength);
+		if (check != luzvda::check_e::ok)
+		{
+			LogRejected(IoControlCode, check);
+			Status = StatusFor(check);
+			break;
+		}
+
+		if (!pDevice)
+		{
+			Status = STATUS_DEVICE_NOT_READY;
+			break;
+		}
+
+		LUZVDA_ADD_OUT out = {};
+		Status = pDevice->AddDisplay(desc, out);
+		if (NT_SUCCESS(Status))
+		{
+			Status = WriteOutput(Request, out, bytesReturned);
+		}
+		break;
+	}
+	case IOCTL_LUZVDA_REMOVE_DISPLAY: {
+		ResetWatchdog();
+
+		LUZVDA_GUID guid;
+		Status = ReadInput(Request, InputBufferLength, guid);
+		if (NT_SUCCESS(Status))
+		{
+			Status = pDevice ? pDevice->RemoveDisplay(guid) : STATUS_DEVICE_NOT_READY;
+		}
+		break;
+	}
+	case IOCTL_LUZVDA_UPDATE_MODES: {
+		ResetWatchdog();
+
+		LUZVDA_UPDATE_MODES update;
+		Status = ReadInput(Request, InputBufferLength, update);
+		if (!NT_SUCCESS(Status))
+		{
+			break;
+		}
+
+		auto check = luzvda::check(update, InputBufferLength);
+		if (check != luzvda::check_e::ok)
+		{
+			LogRejected(IoControlCode, check);
+			Status = StatusFor(check);
+			break;
+		}
+
+		Status = pDevice ? pDevice->UpdateModes(update) : STATUS_DEVICE_NOT_READY;
+		break;
+	}
+	case IOCTL_LUZVDA_SET_RENDER_ADAPTER: {
+		ResetWatchdog();
+
+		LUZVDA_LUID luid;
+		Status = ReadInput(Request, InputBufferLength, luid);
+		if (NT_SUCCESS(Status))
+		{
+			LUID adapter = {luid.low, luid.high};
+			Status = pDevice ? pDevice->SetRenderAdapter(adapter) : STATUS_DEVICE_NOT_READY;
+		}
+		break;
+	}
+	case IOCTL_LUZVDA_LIST_DISPLAYS: {
+		LUZVDA_LIST list = {};
+		{
+			std::lock_guard<std::mutex> lg(g_Registry.lock);
+			for (auto* m : g_Registry.monitors)
+			{
+				if (!m->arrived || list.count >= LUZVDA_MAX_DISPLAYS)
+				{
+					continue;
+				}
+				auto& entry = list.displays[list.count++];
+				entry.monitor_guid = m->desc.monitor_guid;
+				entry.adapter = ToProtocol(m->adapterLuid);
+				entry.target_id = m->targetId;
+				entry.connector = m->connector;
+				entry.preferred_mode = m->monitorModes[m->monitorPreferred];
+			}
+		}
+		Status = WriteOutput(Request, list, bytesReturned);
+		break;
 	}
 	default:
 		break;
@@ -1643,3 +1529,5 @@ VOID SudoVDAIoDeviceControl(
 
 	WdfRequestCompleteWithInformation(Request, Status, bytesReturned);
 }
+
+#pragma endregion

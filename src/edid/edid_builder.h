@@ -49,6 +49,10 @@ namespace luzvda::edid {
     /// 1/10000 nits
     uint32_t min_luminance = 0;
     LUZVDA_MODE preferred {1920, 1080, 60000};
+    /// An experiment: spread a longer name over two name descriptors, the first 13 characters in place
+    /// of the serial text and the next 13 after them, to see whether Windows shows more than 13 (the
+    /// driver's edidSplitName setting)
+    bool split_name = false;
   };
 
   /// sRGB / BT.709 primaries with a D65 white point, in 1/1024
@@ -242,7 +246,8 @@ namespace luzvda::edid {
     // Descriptor 1: the preferred timing
     write_dtd(b + 54, preferred_timing(in.preferred), in.width_mm, in.height_mm);
 
-    // Descriptor 2: the serial as text
+    // Descriptor 2: the serial as text, or the rest of a long name
+    std::string name = in.name.empty() ? std::string("LuzVDA") : in.name;
     char serial_text[16];
     static const char hex[] = "0123456789ABCDEF";
     serial_text[0] = 'L';
@@ -250,14 +255,19 @@ namespace luzvda::edid {
     for (int i = 0; i < 8; ++i) {
       serial_text[2 + i] = hex[(in.serial >> (28 - 4 * i)) & 0xf];
     }
-    write_text_descriptor(b + 72, 0xff, std::string(serial_text, 10));
+    bool split = in.split_name && name.size() > name_chars;
+    if (split) {
+      write_text_descriptor(b + 72, 0xfc, name);
+    } else {
+      write_text_descriptor(b + 72, 0xff, std::string(serial_text, 10));
+    }
 
     // Descriptor 3: range limits, 15-255 Hz, 20-255 kHz, up to 2550 MHz, as SudoVDA had them
     const uint8_t range[18] = {0x00, 0x00, 0x00, 0xfd, 0x00, 0x0f, 0xff, 0x14, 0xff, 0xff, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20};
     std::memcpy(b + 90, range, sizeof(range));
 
     // Descriptor 4: the name
-    write_text_descriptor(b + 108, 0xfc, in.name.empty() ? std::string("LuzVDA") : in.name);
+    write_text_descriptor(b + 108, 0xfc, split ? name.substr(name_chars) : name);
 
     // One extension
     b[126] = 1;

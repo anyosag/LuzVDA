@@ -1,3 +1,17 @@
+/*++
+
+Copyright (c) Microsoft Corporation
+
+Abstract:
+
+	Types for the LuzVDA indirect display driver, based on Microsoft's IddSampleDriver.
+
+Environment:
+
+	User Mode, UMDF
+
+--*/
+
 #pragma once
 
 #define NOMINMAX
@@ -12,10 +26,12 @@
 #include <avrt.h>
 #include <wrl.h>
 
+#include <array>
+#include <cstdint>
 #include <memory>
-#include <queue>
+#include <vector>
 
-#include "Trace.h"
+#include <luzvda/luzvda-ioctl.h>
 
 namespace Microsoft
 {
@@ -29,98 +45,101 @@ namespace Microsoft
 	}
 }
 
-namespace Microsoft
+namespace LuzVDA
 {
-	namespace IndirectDisp
+	/// <summary>
+	/// Manages the creation and lifetime of a Direct3D render device.
+	/// </summary>
+	struct Direct3DDevice
 	{
-		struct VirtualMonitorMode {
-			DWORD Width;
-			DWORD Height;
-			DWORD VSync;
-		};
+		Direct3DDevice(LUID AdapterLuid);
+		HRESULT Init();
 
-		/// <summary>
-		/// Manages the creation and lifetime of a Direct3D render device.
-		/// </summary>
-		struct Direct3DDevice
-		{
-			Direct3DDevice(LUID AdapterLuid);
-			Direct3DDevice();
-			HRESULT Init();
+		LUID AdapterLuid;
+		Microsoft::WRL::ComPtr<IDXGIFactory5> DxgiFactory;
+		Microsoft::WRL::ComPtr<IDXGIAdapter1> Adapter;
+		Microsoft::WRL::ComPtr<ID3D11Device> Device;
+		Microsoft::WRL::ComPtr<ID3D11DeviceContext> DeviceContext;
+	};
 
-			LUID AdapterLuid;
-			Microsoft::WRL::ComPtr<IDXGIFactory5> DxgiFactory;
-			Microsoft::WRL::ComPtr<IDXGIAdapter1> Adapter;
-			Microsoft::WRL::ComPtr<ID3D11Device> Device;
-			Microsoft::WRL::ComPtr<ID3D11DeviceContext> DeviceContext;
-		};
+	/// <summary>
+	/// Manages a thread that consumes buffers from an indirect display swap-chain object.
+	/// </summary>
+	class SwapChainProcessor
+	{
+	public:
+		SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
+		~SwapChainProcessor();
 
-		/// <summary>
-		/// Manages a thread that consumes buffers from an indirect display swap-chain object.
-		/// </summary>
-		class SwapChainProcessor
-		{
-		public:
-			SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
-			~SwapChainProcessor();
+	private:
+		static DWORD CALLBACK RunThread(LPVOID Argument);
 
-		private:
-			static DWORD CALLBACK RunThread(LPVOID Argument);
+		void Run();
+		void RunCore();
 
-			void Run();
-			void RunCore();
+		IDDCX_SWAPCHAIN m_hSwapChain;
+		std::shared_ptr<Direct3DDevice> m_Device;
+		HANDLE m_hAvailableBufferEvent;
+		Microsoft::WRL::Wrappers::Thread m_hThread;
+		Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+	};
 
-			IDDCX_SWAPCHAIN m_hSwapChain;
-			std::shared_ptr<Direct3DDevice> m_Device;
-			HANDLE m_hAvailableBufferEvent;
-			Microsoft::WRL::Wrappers::Thread m_hThread;
-			Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
-		};
+	/// <summary>
+	/// One virtual monitor: what the caller described, the EDID built from it, and its modes.
+	/// Lives in the monitor registry from the add request until it is removed, and is deleted with the
+	/// IddCx monitor object.
+	/// </summary>
+	class IndirectMonitorContext
+	{
+	public:
+		IndirectMonitorContext(const LUZVDA_DISPLAY_DESC& Desc, uint32_t Serial, UINT Connector);
+		~IndirectMonitorContext();
 
-		class IndirectMonitorContext
-		{
-		public:
-			UINT connectorId = 0;
-			LUID adapterLuid{};
-			UINT targetId = 0;
-			GUID monitorGuid{};
+		void AssignSwapChain(IDDCX_MONITOR MonitorObject, IDDCX_SWAPCHAIN SwapChain, const LUID& RenderAdapter, HANDLE NewFrameEvent);
+		void UnassignSwapChain();
 
-			uint8_t* pEdidData = nullptr;
-			VirtualMonitorMode preferredMode{};
-			IDDCX_ADAPTER m_Adapter{};
+		const LUZVDA_DISPLAY_DESC desc;
+		const uint32_t serial;
+		const UINT connector;
+		std::array<uint8_t, 256> edid{};
 
-			IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor);
-			virtual ~IndirectMonitorContext();
+		// The modes reported when the monitor arrived, and the target modes, which an update request
+		// can replace. Windows offers modes that are in both. Guarded by the registry lock.
+		std::vector<LUZVDA_MODE> monitorModes;
+		size_t monitorPreferred = 0;
+		std::vector<LUZVDA_MODE> targetModes;
 
-			void AssignSwapChain(const IDDCX_MONITOR& MonitorObject, const IDDCX_SWAPCHAIN& SwapChain, const LUID& RenderAdapter, const HANDLE& NewFrameEvent);
-			void UnassignSwapChain();
+		// Set once IddCx has the monitor; guarded by the registry lock
+		IDDCX_MONITOR monitor = nullptr;
+		LUID adapterLuid{};
+		UINT targetId = 0;
+		bool arrived = false;
+		bool registered = false;
 
-			IDDCX_MONITOR GetMonitor() const;
+	private:
+		std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
+		Microsoft::WRL::Wrappers::Event m_CursorEvent;
+	};
 
-		private:
-			IDDCX_MONITOR m_Monitor;
-			std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
-		} ;
+	/// <summary>
+	/// The root device and its IddCx adapter.
+	/// </summary>
+	class IndirectDeviceContext
+	{
+	public:
+		IndirectDeviceContext(_In_ WDFDEVICE WdfDevice);
+		virtual ~IndirectDeviceContext();
 
-		/// <summary>
-		/// Provides a sample implementation of an indirect display driver.
-		/// </summary>
-		class IndirectDeviceContext
-		{
-		public:
-			IndirectDeviceContext(_In_ WDFDEVICE WdfDevice);
-			virtual ~IndirectDeviceContext();
+		void InitAdapter();
+		IDDCX_ADAPTER Adapter() const { return m_Adapter; }
 
-			void InitAdapter();
+		NTSTATUS AddDisplay(const LUZVDA_DISPLAY_DESC& Desc, LUZVDA_ADD_OUT& Out);
+		NTSTATUS RemoveDisplay(const LUZVDA_GUID& Guid);
+		NTSTATUS UpdateModes(const LUZVDA_UPDATE_MODES& Update);
+		NTSTATUS SetRenderAdapter(const LUID& AdapterLuid);
 
-			void SetRenderAdapter(const LUID& AdapterLuid);
-
-			void _TestCreateMonitor();
-			NTSTATUS CreateMonitor(IndirectMonitorContext*& pMonitorContext, uint8_t* edidData, const GUID& containerId, const VirtualMonitorMode& preferredMode);
-
-		protected:
-			WDFDEVICE m_WdfDevice;
-			IDDCX_ADAPTER m_Adapter;
-		};
-	}
+	protected:
+		WDFDEVICE m_WdfDevice;
+		IDDCX_ADAPTER m_Adapter = nullptr;
+	};
 }

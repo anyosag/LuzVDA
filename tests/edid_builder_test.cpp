@@ -157,6 +157,21 @@ static void test_sdr() {
   CHECK(find_block(e, 7, 5) < 0);
 }
 
+static void test_split_name() {
+  auto in = macbook_pro_14();
+  in.split_name = true;
+  auto e = build(in);
+  CHECK(checksum_ok(e.data()));
+  CHECK(e[72 + 3] == 0xfc);
+  CHECK(text_at(e, 72) == "MacBook Pro 1");
+  CHECK(text_at(e, 108) == "4 of someone");
+
+  // A short name keeps the serial text
+  in.name = "Short";
+  e = build(in);
+  CHECK(e[72 + 3] == 0xff);
+}
+
 static void test_same_input_same_bytes() {
   CHECK(build(macbook_pro_14()) == build(macbook_pro_14()));
   auto other = macbook_pro_14();
@@ -195,12 +210,17 @@ int main(int argc, char **argv) {
   test_codes();
   test_macbook();
   test_sdr();
+  test_split_name();
   test_same_input_same_bytes();
   test_dtd_fallbacks();
 
   if (argc > 1) {
     std::string dir = argv[1];
     write(dir, "macbook-pro-14-hdr", build(macbook_pro_14()));
+
+    auto split = macbook_pro_14();
+    split.split_name = true;
+    write(dir, "split-name", build(split));
 
     input_t sdr;
     sdr.name = "Office laptop";

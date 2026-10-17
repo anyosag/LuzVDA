@@ -27,7 +27,10 @@ The owner approves once in the PC session and once in the Mac session. That appr
    - an install failure, a crash, or no stream starting twice in a row;
    - more than one active display during a stream, twice in a row.
 3. **Settings:** don't change Apollo's settings beyond the two named here: Desktop's `terminate-on-pause`, and `dd_wa_virtual_display_hdr_toggle`. Both are put back at the end, checked by hash.
-4. **Never:** touch the signing key, Secure Boot or test signing; push anywhere but `test-results/round3` in anyosag/LuzVDA.
+4. **Never:**
+   - touch the signing key, Secure Boot or test signing;
+   - push anywhere but `test-results/round3` in anyosag/LuzVDA;
+   - lock the PC or the Mac, unless the owner says so directly.
 5. **Times and redaction:** times are UTC. Redact what you push: `<ip>`, `<uuid>`, `<computer>`.
 6. **Folders:** use `C:\LuzVDA\r3\` on the PC and `/tmp/r3/` on the Mac.
 
@@ -131,8 +134,7 @@ When `MAC DONE` arrives:
    - the per-launch details;
    - the long stream's restart table;
    - surprises.
-5. Send `ROUND3 DONE` to Cloud with the link and a line per row.
-6. ⚠ Lock the PC: `rundll32.exe user32.dll,LockWorkStation`.
+5. Send `ROUND3 DONE` to Cloud with the link and a line per row. Leave the PC unlocked.
 
 ---
 

@@ -1,48 +1,104 @@
-# SudoVDA
-Based on Microsoft Indirect Display Driver Sample. This creates a virtual display in Windows that acts and functions just like a real one. It's useful for streaming, virtual reality applications, recording, headless servers, etc. The benefit over a physical display is the ability to adjust resolutions and refresh rates beyond the physical displays capabilities. For example, this would enable the ability to stream a game from your home PC using game streaming software at 240hz at 8K while owning a 60hz 1080p monitor (~~unrealistic,~~ but explains the abilities well). For servers without displays, this enabled remote desktop and screen streaming to other systems as if there were a display installed. 
+# LuzVDA
 
-Supports emulating resolutions from **640 x 480** to **7680 x 4320 (8K)**, and refresh rates including **60hz, 75hz, 90hz, 120hz, 144hz, 165hz, 240hz, 480hz,** and **500hz.**
+A virtual display driver for [Apollo](https://github.com/anyosag/Apollo) and [LuzLunar](https://github.com/anyosag/LuzLunar). Apollo adds a display when a client starts streaming and removes it when the stream ends. Each display describes the screen it stands in for: the client's physical size, color primaries, HDR brightness and exact modes. Windows then picks a sensible scale and tone-maps HDR for that screen, not a generic one.
 
-This project uses the official Windows Indirect Display Driver combined with the IddCx class extension driver. GitHub shows it's a fork of MTT's Virtual Display Driver, but it actually went a full rewrite half way. I keep the fork info for honoring the previous works done by MTT. 
+It's a fork of [SudoVDA](https://github.com/SudoMaker/SudoVDA), built on Microsoft's Indirect Display Driver sample (IddCx). See [NOTICE.md](NOTICE.md) for where each part comes from and its license.
 
-## Notice
+## How it differs from SudoVDA
 
-HDR is only fully supported on Windows 11 24H2. On 23H2 and lower, you'll try your luck to get the HDR toggle in Windows settings. HDR is not supported on Windows 10.
+| | SudoVDA | LuzVDA |
+|---|---|---|
+| Who can add or remove displays | Any program (the device was open to Everyone) | SYSTEM and Administrators |
+| What a display reports | One fixed EDID: 70×39 cm, about 3,800 nits, zero color primaries; only the name and serial change | An EDID built from the caller's description, checked with `edid-decode` |
+| Modes | 47 built-in modes plus scaled copies of the requested one | Exactly the caller's modes (up to 32), plus 1920×1080 at 60 Hz |
+| HDR | Offered on every display | Only on displays described as HDR: their EDID declares it, and Windows offers "Use HDR" only for those |
+| Changing modes | Not possible without re-adding the display | `UPDATE_MODES` replaces the modes, and Windows then switches to a new one without the display being re-added |
+| Requests | No size or string checks | Every field checked (`src/common/validate.h`, tested) |
+| Signing | SudoMaker's self-signed certificate, added to Trusted Root by Apollo's installer | Yours, made on your PC by `scripts/new-signing-cert.ps1` |
+| Windows | 10 and 11 | 11 24H2 (build 26100) and later only |
 
-## Config
+It also fixes SudoVDA bugs: monitor contexts, EDIDs and a named event handle leaked on every display; lists were read without the lock; a full connector list blocked re-adding an existing display; a failed arrival left a half-made display behind; an invalid render GPU could abandon swap-chains forever; the EDID serial used only part of the GUID; and the manufacturer ID SMK belongs to SMK Corporation.
 
-In Registry path `\HKEY_LOCAL_MACHINE\SOFTWARE\SudoMaker\SudoVDA` (create one if not exists):
+## Tested
 
-- `gpuName`    [STRING]: The friendly name for the GPU which the virtual adapter connects to. Default unset, will choose the card with biggest videoram automatically.
-- `maxMonitors` [DWORD]: Number of maximum virtual monitors can be created. Defaults to 10(decimal).
-- `watchdog`    [DWORD]: Timeout in seconds for the watchdog to bark. Defaults to 3, set 0 to disable watchdog.
-- `sdrBits`     [DWORD]: Bits for SDR mode. Defaults to 8(decimal)/8(HEX), set 10(decimal)/a(HEX) to enable SDR 10 bits, other values are ignored.
-- `hdrBits`     [DWORD]: Bits for HDR mode. Defaults to 10(decimal)/a(HEX), set 12(decimal)/c(HEX) to enable HDR12 bits/HDR+, other values are ignored.
+0.0.0.7 was tested on Windows 11 build 26200 with an NVIDIA RTX 5080 and Secure Boot off: [results](https://github.com/anyosag/LuzVDA/blob/test-results/first-test/results/first-test-0.0.0.7.md).
+- Windows reads each display's brightness and primaries from its EDID: 1,600 / 994 nits and Display P3 for a MacBook Pro display.
+- A display can take new modes without being re-added.
+- Brightness isn't part of how Windows recognizes a display, so changing it keeps the display's settings.
+- Displays described without HDR get no "Use HDR".
+- The watchdog removes displays of a caller that stopped.
+- Ten adds and removes in a row leave nothing behind.
 
-**NOTE**: After changing these values, you'll need to reload the driver or reboot your computer for them to take effect. Please note that if the driver is currently opened by something else, for example Apollo, it won't be able to reload, you'll need to quit the application before reloading the driver.
+Installing next to SudoVDA while Apollo holds SudoVDA open needs a restart to finish. Whether a driver signed this way installs with Secure Boot on is untested.
 
-## License
+## Requirements
 
-MIT and CC0 or Public Domain (for changes I made, please consult Microsoft for their license), choose the least restrictive option.
+- Windows 11 24H2 or later, x64.
+- A build signed with a certificate the PC trusts (see Signing).
 
-## Disclaimer:
+## Control interface
 
-This software is provided "AS IS" with NO IMPLICIT OR EXPLICIT warranty. It's worth noting that while this software functioned without issues on my system, there is no guarantee that it will not impact your computer. It operates in User Mode, which reduces the likelihood of causing system instability, such as the Blue Screen of Death. However, exercise caution when using this software.
+`include/luzvda/luzvda-ioctl.h` (MIT) defines protocol 1.0: get version, ping, get watchdog, add, remove, update modes, set render adapter, and list. Callers open the device interface `{15d7851f-629d-4e2a-bffd-9c5f43ddd57a}` for reading and writing.
 
-## Acknowledgements
+The watchdog removes every display when no request has arrived for its timeout (3 s by default), so a crashed caller doesn't leave displays behind. Callers ping at a third of the timeout.
 
-Shoutout to **Roshkins** for the original repo:
-https://github.com/roshkins/IddSampleDriver
+## Settings
 
-Shoutout to **Baloukj** for the 8-bit / 10-bit support. (Also, first to push the new Microsoft Driver public!)
-https://github.com/baloukj/IddSampleDriver
+Under `HKLM\SOFTWARE\LuzVDA`. They're read when the driver loads, so restart the device after changing them.
 
-Shoutout to **Anakngtokwa** for assisting with finding driver sources.
+| Value | Type | Default | Meaning |
+|---|---|---|---|
+| `gpuName` | REG_SZ | unset | The GPU that renders the displays, by its name; unset leaves it to the caller or Windows |
+| `watchdog` | DWORD | 3 | Seconds without a request before displays are removed; 0 turns it off; at most 60 |
+| `maxMonitors` | DWORD | 10 | 1 to 16 |
+| `sdrBits` | DWORD | 8 | 10 for 10-bit SDR only |
+| `hdrBits` | DWORD | 10 | 12 for 12-bit HDR only |
+| `edidSplitName` | DWORD | 1 | Names longer than 13 characters go into two EDID name descriptors, and Windows shows them whole; 0 keeps the first 13 |
 
-**Microsoft** Indirect Display Driver/Sample (Driver code): 
-https://github.com/microsoft/Windows-driver-samples/tree/master/video/IndirectDisplay
+## Building
 
-Thanks to **AKATrevorJay** https://github.com/akatrevorjay/edid-generator for the hi-res EDID.
+CI builds every push (`.github/workflows/build.yml`) and publishes an **unsigned** zip with its SHA256 and build provenance. A tag `vX.Y.Z` builds version `X.Y.Z.<run number>`.
 
-Shoutout to **zjoasan** and **Bud** for the helper scripts and build support!
+Locally, with Visual Studio 2022 or later:
 
+```powershell
+nuget restore .\packages.config -PackagesDirectory .\packages\
+msbuild LuzVDA.sln -p:Configuration=Release -p:Platform=x64
+```
+
+Tests that don't need Windows:
+
+```sh
+g++ -std=c++17 -Iinclude -Isrc tests/validate_test.cpp -o validate_test && ./validate_test
+g++ -std=c++17 -Iinclude -Isrc tests/edid_builder_test.cpp -o edid_builder_test
+./edid_builder_test out && for f in out/*.bin; do edid-decode --check "$f"; done
+```
+
+## Signing
+
+Builds are signed by whoever installs them, with a key that never leaves their PC. You need the Windows SDK's signing tools (`signtool.exe`) and the GitHub CLI (`winget install GitHub.cli`, then `gh auth login`). On the PC, in an elevated PowerShell:
+
+1. Download the `LuzVDA-<version>-ci` artifact from a CI run and extract it. It holds `LuzVDA-<version>-unsigned.zip` and `SHA256SUMS.txt`; extract the scripts from that zip too.
+2. Let this PowerShell window run the scripts: `Set-ExecutionPolicy -Scope Process Bypass`.
+3. Once: `.\new-signing-cert.ps1`. It creates a non-exportable code-signing key in the machine's certificate store, trusts it for drivers on this PC, and writes the public `luzvda.cer`.
+4. For each release: `.\sign-package.ps1 -Zip .\LuzVDA-<version>-unsigned.zip`. It checks the hash and the build provenance (`gh attestation verify`), signs with `signtool`, and writes `LuzVDA-<version>.zip`.
+
+Any PC that trusts your certificate will install drivers and run software you sign. Install it only on your own machines.
+
+## Installing and trying it
+
+For a first install next to SudoVDA, follow [docs/first-test.md](docs/first-test.md).
+
+Apollo's installer does this. By hand, from the signed zip, in an elevated prompt:
+
+```bat
+luzvda-ctl remove-legacy
+luzvda-ctl install LuzVDA.inf
+luzvda-ctl add 6a0b9c1e-3f4d-4c2a-9e7b-1d2c3b4a5f60 --name "MacBook Pro" --mode 3024x1964@120 --mode 3024x1890@120 --size 302x196 --p3 --hdr 1600,1000,0.005
+```
+
+`add` keeps the display until you press Enter. Meanwhile, in another prompt:
+
+- `luzvda-ctl diag` shows what Windows and DXGI report for it: mode, monitor name, HDR state, luminance, primaries, and the rendering GPU.
+- `luzvda-ctl set-mode <guid> 3024x1890@60` asks Windows to switch modes.
+- `luzvda-ctl hdr <guid> on` switches HDR.

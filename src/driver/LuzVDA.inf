@@ -1,0 +1,76 @@
+;
+; LuzVDA.inf
+;
+
+[Version]
+PnpLockdown=1
+Signature="$Windows NT$"
+ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Class = Display
+ClassVer = 2.0
+Provider=%ManufacturerName%
+CatalogFile=luzvda.cat
+DriverVer= ; set by stampinf from the build's version
+
+; Windows 11 24H2 (build 26100) and later: HDR and exact refresh rates need IddCx 1.10
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...26100
+
+[Standard.NT$ARCH$.10.0...26100]
+%DeviceName%=LuzVDA_Install, Root\LuzVDA
+%DeviceName%=LuzVDA_Install, LuzVDA
+
+[SourceDisksFiles]
+LuzVDA.dll=1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== UMDF Device ==================================
+
+[LuzVDA_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[LuzVDA_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg = LuzVDA_HardwareDeviceSettings
+
+; Only SYSTEM and Administrators may open the device. SudoVDA also let Everyone read and write, so
+; any program could add or remove displays.
+[LuzVDA_HardwareDeviceSettings]
+HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "LuzVDAGroup"
+HKR,, "Security",, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[LuzVDA_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[LuzVDA_Install.NT.Wdf]
+UmdfService=LuzVDA,LuzVDA_Install
+UmdfServiceOrder=LuzVDA
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[LuzVDA_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\LuzVDA.dll
+UmdfExtensions = IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF ; copy to drivers\umdf
+
+[UMDriverCopy]
+LuzVDA.dll
+
+; =================== Generic ==================================
+
+[Strings]
+ManufacturerName="LuzVDA"
+DiskName = "LuzVDA Installation Disk"
+DeviceName="LuzVDA Virtual Display Adapter"
+
+REG_MULTI_SZ  = 0x00010000
+REG_SZ        = 0x00000000

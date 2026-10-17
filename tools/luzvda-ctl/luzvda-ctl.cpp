@@ -567,6 +567,7 @@ static void usage() {
     "      --add                    add a MacBook Pro-like display with this GUID first, and remove it after\n"
     "      --seconds N              how long to measure (default 20)\n"
     "      --hdr on|off             switch the display's HDR first\n"
+    "      --fps N                  present at most N frames a second (default: as fast as Windows allows)\n"
     "      --hdr-switch-every N     switch the display's HDR off and on every N seconds\n"
     "      --only channel|duplication\n"
     "      --debug-privilege        enable SeDebugPrivilege, so the channel's handles can be duplicated\n"
@@ -877,6 +878,23 @@ static int64_t qpc_frequency() {
   LARGE_INTEGER f;
   QueryPerformanceFrequency(&f);
   return f.QuadPart;
+}
+
+// A QueryPerformanceCounter time as UTC HH:MM:SS.mmm, to line up with other logs
+static std::string utc_of(int64_t qpc) {
+  static const int64_t base_qpc = qpc_now();
+  static const ULONGLONG base_ft = [] {
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    return ((ULONGLONG) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  }();
+  ULONGLONG ft = base_ft + (ULONGLONG) ((double) (qpc - base_qpc) * 1e7 / (double) qpc_frequency());
+  FILETIME f = {(DWORD) ft, (DWORD) (ft >> 32)};
+  SYSTEMTIME st;
+  FileTimeToSystemTime(&f, &st);
+  char out[16];
+  std::snprintf(out, sizeof(out), "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+  return out;
 }
 
 template <class T>
@@ -1415,6 +1433,9 @@ static void report_path(const capture_path_t &path, int64_t from, int64_t to, ui
   }
   std::printf("  longest wait for a new frame: %.1f ms\n", longest_gap(samples, from, to, ms_per_tick));
   std::printf("  started over %zu times\n", path.restarts.size());
+  for (int64_t t : path.restarts) {
+    std::printf("    at %s UTC\n", utc_of(t).c_str());
+  }
   for (size_t i = 0; i < toggles.size(); ++i) {
     int64_t end = std::min(to, toggles[i] + (int64_t) (5000.0 / ms_per_tick));
     std::printf("  HDR switch %zu: longest wait in the 5 s after it %.1f ms\n", i + 1, longest_gap(samples, toggles[i], end, ms_per_tick));
@@ -1432,6 +1453,7 @@ static int cmd_capture_test(int argc, char **argv) {
   }
   double seconds = 20;
   double toggle_every = 0;
+  double fps = 0;
   bool add = false;
   bool debug_privilege = false;
   std::string only;
@@ -1449,6 +1471,8 @@ static int cmd_capture_test(int argc, char **argv) {
       debug_privilege = true;
     } else if (std::strcmp(argv[i], "--hdr") == 0 && i + 1 < argc) {
       hdr = argv[++i];
+    } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+      fps = std::atof(argv[++i]);
     } else {
       std::fprintf(stderr, "Unknown option %s\n", argv[i]);
       return 2;
@@ -1520,6 +1544,7 @@ static int cmd_capture_test(int argc, char **argv) {
       Sleep(100);
     }
   }
+  utc_of(qpc_now());  // fixes the clock mapping now
   int status = 0;
   RECT monitor = {};
   if (!found || !monitor_rect(active.gdi_name, monitor)) {
@@ -1585,7 +1610,16 @@ static int cmd_capture_test(int argc, char **argv) {
     bool hdr_on = hdr != "off";
     uint64_t presented = 0;
     std::vector<int64_t> toggles;
+    int64_t interval = fps > 0 ? (int64_t) (1000.0 / fps / ms_per_tick) : 0;
+    int64_t next_frame = start;
     for (int64_t now = start; now < end; now = qpc_now()) {
+      // At most --fps frames a second: Windows otherwise paces presents by the fastest display
+      if (interval) {
+        while (qpc_now() < next_frame) {
+          Sleep((double) (next_frame - qpc_now()) * ms_per_tick > 2.0 ? 1 : 0);
+        }
+        next_frame = std::max(next_frame + interval, qpc_now());
+      }
       MSG msg;
       while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
